@@ -11,6 +11,7 @@ from dataset.frame import (
     ActionSpotDatasetJoint,
     ActionSpotVideoDataset,
 )
+from dataset.frame_ct import ActionSpotDatasetCT
 
 #Local imports
 from util.dataset import load_classes
@@ -151,3 +152,75 @@ def get_datasets(args):
         val_data = ActionSpotDatasetJoint(val_data, pretrain_val_data)
 
     return classes, pretrain_classes, train_data, val_data, val_data_frames
+
+
+def get_datasets_ct(args):
+    """Factory for CT-mode datasets (contact-state transition)."""
+    classes = load_classes(os.path.join('data', args.dataset, 'class.txt'))
+
+    dataset_len = args.epoch_num_frames // args.clip_len
+    stride = STRIDE
+    overlap = OVERLAP
+
+    base_kwargs = {
+        'stride': stride,
+        'overlap': overlap,
+        'radi_displacement': 0,  # CT mode does not use displacement
+        'mixup': False,
+        'dataset': args.dataset,
+    }
+
+    print('[INFO] CT Dataset size:', dataset_len)
+
+    train_label_path = os.path.join('data', args.dataset, 'train.json')
+    if not os.path.exists(train_label_path):
+        print(f'[ERROR] Training label file {train_label_path} not found!')
+        import sys; sys.exit(1)
+
+    train_data = ActionSpotDatasetCT(
+        classes,
+        train_label_path,
+        args.frame_dir,
+        args.store_dir,
+        args.store_mode,
+        args.modality,
+        args.clip_len,
+        dataset_len,
+        crop_dim=args.crop_dim,
+        soft_labels=False,
+        **base_kwargs,
+    )
+    train_data.print_info()
+
+    val_label_path = os.path.join('data', args.dataset, 'val.json')
+    if not os.path.exists(val_label_path):
+        val_label_path = os.path.join('data', args.dataset, 'test.json')
+
+    val_data = ActionSpotDatasetCT(
+        classes,
+        val_label_path,
+        args.frame_dir,
+        args.store_dir,
+        args.store_mode,
+        args.modality,
+        args.clip_len,
+        dataset_len // 4,
+        crop_dim=args.crop_dim,
+        soft_labels=False,
+        **base_kwargs,
+    )
+    val_data.print_info()
+
+    val_data_frames = ActionSpotVideoDataset(
+        classes,
+        val_label_path,
+        args.frame_dir,
+        args.modality,
+        args.clip_len,
+        overlap_len=0,
+        crop_dim=args.crop_dim,
+        stride=stride,
+        dataset=args.dataset,
+    )
+
+    return classes, None, train_data, val_data, val_data_frames

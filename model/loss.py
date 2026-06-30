@@ -181,3 +181,187 @@ class FocalLossPlain(nn.Module):
             return loss.sum()
         else:
             return loss  # (B,)
+
+
+class CTLoss(nn.Module):
+    """
+    Contact-State Transition loss.
+
+    Operates on per-frame sigmoid outputs (r_t, p_t, c_t) produced by CTHead,
+    and the 6 CT label arrays from ActionSpotDatasetCT.
+
+    Components:
+        L_trans  - Focal BCE on transition response r_t (masked by m_r)
+        L_peak   - peak-contrast hinge: neighbours of a peak must be weaker by margin
+        L_bg     - background sparsity: push non-event r_t towards 0
+        L_pol    - BCE on polarity p_t (masked by m_p)
+        L_rank   - contactness ranking: c_t should be higher after touch, lower after untouch
+        L_contact- masked BCE on contactness c_t (optional; set lambda_c=0 to disable)
+    """
+
+    def __init__(
+        self,
+        lambda_peak: float = 1.0,
+        lambda_bg: float = 0.3,
+        lambda_pol: float = 1.0,
+        lambda_rank: float = 0.5,
+        lambda_contact: float = 0.1,
+        focal_alpha: float = 0.25,
+        focal_gamma: float = 2.0,
+        peak_margin: float = 0.2,
+        rank_margin: float = 0.3,
+        rank_delta: int = 4,
+    ):
+        super().__init__()
+        self.lambda_peak = lambda_peak
+        self.lambda_bg = lambda_bg
+        self.lambda_pol = lambda_pol
+        self.lambda_rank = lambda_rank
+        self.lambda_contact = lambda_contact
+        self.alpha = focal_alpha
+        self.gamma = focal_gamma
+        self.peak_margin = peak_margin
+        self.rank_margin = rank_margin
+        self.rank_delta = rank_delta
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _focal_bce(self, r: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        """Focal BCE on r, masked by m (0 = ignore)."""
+        bce = F.binary_cross_entropy(r, y, reduction='none')  # r already sigmoid
+        p_t = y * r + (1 - y) * (1 - r)
+        mod = (1.0 - p_t.clamp_min(1e-8)).pow(self.gamma)
+        alpha_t = self.alpha * y + (1 - self.alpha) * (1 - y)
+        loss = alpha_t * mod * bce * m
+        denom = m.sum().clamp_min(1)
+        return loss.sum() / denom
+
+    def _peak_contrast(self, r: torch.Tensor, y_r: torch.Tensor, m_r: torch.Tensor) -> torch.Tensor:
+        """
+        For each frame t* where y_r==1.0 (peak center) and m_r==1,
+        penalise neighbours Δ∈{±1..±4} that are within `peak_margin` of r[t*].
+
+        L_peak = mean_{t*} mean_{Δ} max(0, margin - r[t*] + r[t*+Δ])
+        """
+        peak_mask = (y_r == 1.0) & (m_r == 1.0)
+        B, L = r.shape
+        loss = r.new_zeros(1)
+        n = 0
+
+        for delta in range(-4, 5):
+            if delta == 0:
+                continue
+            if delta > 0:
+                r_shift = torch.cat(
+                    [r[:, delta:], r.new_zeros(B, delta)], dim=1)
+                valid = peak_mask.clone()
+                valid[:, L - delta:] = False
+            else:
+                d = -delta
+                r_shift = torch.cat(
+                    [r.new_zeros(B, d), r[:, :L - d]], dim=1)
+                valid = peak_mask.clone()
+                valid[:, :d] = False
+
+            hinge = torch.clamp(
+                self.peak_margin - r[valid] + r_shift[valid], min=0.0)
+            loss = loss + hinge.sum()
+            n += int(valid.sum().item())
+
+        return loss / max(n, 1)
+
+    def _ranking_loss(
+        self,
+        c: torch.Tensor,
+        y_r: torch.Tensor,
+        y_p: torch.Tensor,
+        m_r: torch.Tensor,
+    ) -> torch.Tensor:
+        """
+        For each transition peak t*:
+          - touch  (y_p=1): c_after  should exceed c_before  by rank_margin
+          - untouch(y_p=0): c_before should exceed c_after   by rank_margin
+        Windows: [t*-rank_delta, t*) and (t*, t*+rank_delta]
+        """
+        peak_mask = (y_r == 1.0) & (m_r == 1.0)
+        B, L = c.shape
+        delta = self.rank_delta
+        loss = c.new_zeros(1)
+        n = 0
+
+        for b in range(B):
+            idxs = peak_mask[b].nonzero(as_tuple=True)[0]
+            for t in idxs.tolist():
+                pre_s = max(0, t - delta)
+                post_e = min(L, t + delta + 1)
+
+                if t <= pre_s or t + 1 >= post_e:
+                    continue
+
+                c_before = c[b, pre_s:t].mean()
+                c_after = c[b, t + 1:post_e].mean()
+                polarity = y_p[b, t].item()
+
+                if polarity == 1.0:  # touch: expect higher contact after
+                    loss = loss + torch.clamp(
+                        self.rank_margin - c_after + c_before, min=0.0)
+                else:               # untouch: expect lower contact after
+                    loss = loss + torch.clamp(
+                        self.rank_margin - c_before + c_after, min=0.0)
+                n += 1
+
+        return loss / max(n, 1)
+
+    # ------------------------------------------------------------------
+    # Forward
+    # ------------------------------------------------------------------
+
+    def forward(
+        self,
+        ct_feat: torch.Tensor,  # (B, L, 3): [r_t, p_t, c_t] after sigmoid
+        y_r: torch.Tensor,      # (B, L)
+        m_r: torch.Tensor,      # (B, L)
+        y_p: torch.Tensor,      # (B, L)
+        m_p: torch.Tensor,      # (B, L)
+        y_c: torch.Tensor,      # (B, L)
+        m_c: torch.Tensor,      # (B, L)
+    ):
+        r = ct_feat[:, :, 0]  # (B, L)
+        p = ct_feat[:, :, 1]
+        c = ct_feat[:, :, 2]
+
+        L_trans = self._focal_bce(r, y_r, m_r)
+        L_peak = self._peak_contrast(r, y_r, m_r)
+
+        bg_mask = (y_r == 0.0) & (m_r == 1.0)
+        bg_sum = bg_mask.sum().clamp_min(1)
+        L_bg = (r * bg_mask.float()).sum() / bg_sum
+
+        pol_denom = m_p.sum().clamp_min(1)
+        L_pol = (F.binary_cross_entropy(p, y_p, reduction='none') * m_p).sum() / pol_denom
+
+        L_rank = self._ranking_loss(c, y_r, y_p, m_r)
+
+        con_denom = m_c.sum().clamp_min(1)
+        L_contact = (F.binary_cross_entropy(c, y_c, reduction='none') * m_c).sum() / con_denom
+
+        total = (
+            L_trans
+            + self.lambda_peak * L_peak
+            + self.lambda_bg * L_bg
+            + self.lambda_pol * L_pol
+            + self.lambda_rank * L_rank
+            + self.lambda_contact * L_contact
+        )
+
+        detail = {
+            'trans': L_trans.item(),
+            'peak': L_peak.item(),
+            'bg': L_bg.item(),
+            'pol': L_pol.item(),
+            'rank': L_rank.item(),
+            'contact': L_contact.item(),
+        }
+        return total, detail

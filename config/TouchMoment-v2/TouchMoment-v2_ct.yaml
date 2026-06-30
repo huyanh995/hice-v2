@@ -1,0 +1,65 @@
+frame_dir: /data/CVPR26_HiCE/TouchMoment/Frames
+save_dir: /data/CVPR26_HiCE/TouchMoment-v2_Exp/save
+store_dir: /data/CVPR26_HiCE/TouchMoment-v2_Exp/store
+store_mode: load
+
+# Dataset
+dataset: TouchMoment-v2
+modality: rgb
+num_classes: 2
+tolerance: [0, 1, 2]
+window: [1, 3]
+eval_split: [test]
+
+# Ablation
+soft_labels: false
+grasp_loss: true
+bi_interp_post: true
+temporal_shift: true
+
+# Data loading
+batch_size: 6
+clip_len: 40
+crop_dim: 224
+num_workers: 4
+
+# Model — keep same backbone/temporal as baseline; only head changes
+feature_arch: rny008_gsf
+temporal_arch: ed_sgp_mixer
+n_layers: 3
+sgp_ks: 9
+sgp_r: 4
+amp: true
+
+# Training
+num_epochs: 50
+warm_up_epochs: 3
+start_val_epoch: 0
+learning_rate: 0.0004
+acc_grad_iter: 1
+epoch_num_frames: 200000
+mixup: false
+
+# CT mode — replaces loss.type; displacement head removed
+ct_mode: true
+radi_displacement: 0
+
+# CT loss hyperparameters
+ct_loss:
+  lambda_peak: 1.0
+  lambda_bg: 0.3
+  lambda_pol: 1.0
+  lambda_rank: 0.5
+  lambda_contact: 0.1
+  focal_alpha: 0.25
+  focal_gamma: 2.0
+
+# loss block still required by update_args to avoid KeyError; not used in CT mode
+loss:
+  type: focal
+  focal:
+    alpha: 0.25
+    gamma: 2.0
+
+# Evaluation
+criterion: map

@@ -95,6 +95,10 @@ def update_args(args, config):
     elif args.loss_type == 'focal':
         print(f'[INFO] Using Focal loss with alpha {args.focal_alpha} and gamma {args.focal_gamma}')
 
+    # CT mode
+    args.ct_mode = config.get('ct_mode', False)
+    args.ct_loss = config.get('ct_loss', {})
+
     # Optional parameters
     args.pretrain = config.get('pretrain', None)
     args.clip_grad = config.get('clip_grad', None)
@@ -165,10 +169,11 @@ def main(args):
     from torch.optim.lr_scheduler import ChainedScheduler, CosineAnnealingLR, LinearLR
     from torch.utils.data import DataLoader
 
-    from dataset.datasets import get_datasets
+    from dataset.datasets import get_datasets, get_datasets_ct
     from dataset.frame import ActionSpotVideoDataset
     from model.model import TDEEDModel
     from util.eval import evaluate
+    from util.eval_ct import evaluate_ct
 
     #Local imports
     from util.io import load_from_save, load_json, load_text, load_yaml, store_json
@@ -244,7 +249,10 @@ def main(args):
                mode = 'online' if args.wandb else 'disabled')
 
     # Get datasets train, validation (and validation for map -> Video dataset)
-    classes, pretrain_classes, train_data, val_data, val_data_frames = get_datasets(args)
+    if args.ct_mode:
+        classes, pretrain_classes, train_data, val_data, val_data_frames = get_datasets_ct(args)
+    else:
+        classes, pretrain_classes, train_data, val_data, val_data_frames = get_datasets(args)
 
     if args.store_mode == 'store':
         print('Datasets have been stored correctly! Stop training here and rerun.')
@@ -328,7 +336,8 @@ def main(args):
                     better = True
             elif args.criterion == 'map':
                 if epoch >= args.start_val_epoch:
-                    val_mAP = evaluate(model, val_data_frames, 'VAL', classes, tolerances=args.tolerances, windows=args.windows, printed=False, test=False)
+                    _eval_fn = evaluate_ct if args.ct_mode else evaluate
+                    val_mAP = _eval_fn(model, val_data_frames, 'VAL', classes, tolerances=args.tolerances, windows=args.windows, printed=False, test=False)
 
                     if val_mAP > best_criterion:
                         best_criterion = val_mAP
@@ -368,7 +377,12 @@ def main(args):
                            os.path.join(os.getcwd(), args.save_dir, 'checkpoint_last.pt'))
 
             # Log to wandb
-            if (args.criterion == 'map'):
+            if args.ct_mode:
+                wandb.log({'losses/train_loss': train_loss, 'losses/val_loss': val_loss,
+                           'losses/val_mAP': val_mAP})
+                wandb.log({f'train/ct_{k}': v for k, v in train_loss_dict.items()})
+                wandb.log({f'val/ct_{k}': v for k, v in val_loss_dict.items()})
+            elif (args.criterion == 'map'):
                 wandb.log({'losses/train_loss': train_loss, 'losses/val_loss': val_loss, 'losses/val_mAP': val_mAP})
                 wandb.log({'train/main_loss': train_loss_dict['main_loss'],
                            'train/displ_loss': train_loss_dict['displ_loss'],
@@ -376,7 +390,6 @@ def main(args):
                 wandb.log({'val/main_loss': val_loss_dict['main_loss'],
                            'val/displ_loss': val_loss_dict['displ_loss'],
                            'val/grasp_loss': val_loss_dict['grasp_loss']})
-
             else:
                 wandb.log({'losses/train_loss': train_loss, 'losses/val_loss': val_loss})
             wandb.log({'losses/lr': current_lr})
@@ -412,9 +425,10 @@ def main(args):
             # Augmentation is only turned off with SoccerNet or SoccerNetBall.
             # Since we don't use that dataset, set to on always.
 
-            mAPs, tolerances = evaluate(model, split_data, split.upper(), classes,
-                                        tolerances=args.tolerances,  windows=args.windows,
-                                        printed = True, test = True, augment = args.aug, save_dir=args.save_dir)
+            _eval_fn = evaluate_ct if args.ct_mode else evaluate
+            mAPs, tolerances = _eval_fn(model, split_data, split.upper(), classes,
+                                        tolerances=args.tolerances, windows=args.windows,
+                                        printed=True, test=True, save_dir=args.save_dir)
 
 
             for i in range(len(mAPs)):

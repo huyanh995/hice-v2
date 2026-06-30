@@ -17,7 +17,7 @@ from torch.nn.modules.batchnorm import _BatchNorm
 from torchvision.ops import roi_align
 from tqdm import tqdm
 
-from model.loss import BCELoss, FocalLoss, FocalLossPlain
+from model.loss import BCELoss, CTLoss, FocalLoss, FocalLossPlain
 
 #Local imports
 from model.modules import (
@@ -134,15 +134,24 @@ class TDEEDModel(BaseRGBModel):
             # Positional encoding
             self.temp_enc = nn.Parameter(torch.normal(mean = 0, std = 1 / args.clip_len, size = (args.clip_len, self._d)))
 
+            self._ct_mode = getattr(args, 'ct_mode', False)
+
             if self._temp_arch == 'ed_sgp_mixer':
                 self._temp_fine = EDSGPMIXERLayers(feat_dim, args.clip_len, num_layers=args.n_layers, ks = args.sgp_ks, k = args.sgp_r, concat = True)
                 print(f'[INFO] Loaded {self._temp_arch} temporal architecture with {args.n_layers} blocks, ks = {args.sgp_ks}, k = {args.sgp_r} and using concatenation.')
-                self._pred_fine = FCLayers(self._feat_dim, args.num_classes+1)
+                if self._ct_mode:
+                    self._pred_fine = TDEEDModel.CTHead(self._feat_dim)
+                    print('[INFO] CT mode: using CTHead (3-sigmoid head) on SGPMixer output.')
+                else:
+                    self._pred_fine = FCLayers(self._feat_dim, args.num_classes+1)
                 radi_input_dim = self._feat_dim
                 print('[INFO] Using SGPMixer')
             elif self._temp_arch == 'mstcn':
                 self._temp_fine = SingleStageTCN(feat_dim, 256, feat_dim, num_layers=args.n_layers, dilate=True)
-                self._pred_fine = FCLayers(self._feat_dim, args.num_classes+1)
+                if self._ct_mode:
+                    self._pred_fine = TDEEDModel.CTHead(self._feat_dim)
+                else:
+                    self._pred_fine = FCLayers(self._feat_dim, args.num_classes+1)
                 radi_input_dim = self._feat_dim
                 print(f'[INFO] Using MS-TCN (SingleStageTCN) with {args.n_layers} dilated layers.')
             elif self._temp_arch == 'asformer':
@@ -158,7 +167,7 @@ class TDEEDModel(BaseRGBModel):
                 radi_input_dim = 2 * self._feat_dim
                 print('[INFO] Using GRU')
 
-            if self._radi_displacement > 0:
+            if not self._ct_mode and self._radi_displacement > 0:
                 # self._pred_displ = FCLayers(self._feat_dim, 1)
                 self._pred_displ = FCLayers(radi_input_dim, 1)
                 print(f'[INFO] Using displacement with {self._radi_displacement} radius.')
@@ -313,23 +322,25 @@ class TDEEDModel(BaseRGBModel):
                 im_feat = self._temp_fine(im_feat) # (B, L, 768)
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
-                if self._radi_displacement > 0:
+                if self._ct_mode:
+                    ct_feat = self._pred_fine(im_feat)  # (B, L, 3) sigmoid
+                    res = {'ct_feat': ct_feat}
+                elif self._radi_displacement > 0:
                     displ_feat = self._pred_displ(im_feat).squeeze(-1) # (B, L) -> regression displacement for each frame
                     im_feat = self._pred_fine(im_feat) # (B, L, num_classes+1) -> class predictions for each frame
-                    # return {'im_feat': im_feat, 'displ_feat': displ_feat}, y
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
-
                 else:
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat}
-
-                # return im_feat, y
 
             elif self._temp_arch in ('mstcn', 'asformer'):
                 im_feat = self._temp_fine(im_feat) # (B, L, feat_dim)
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
-                if self._radi_displacement > 0:
+                if self._ct_mode:
+                    ct_feat = self._pred_fine(im_feat)
+                    res = {'ct_feat': ct_feat}
+                elif self._radi_displacement > 0:
                     displ_feat = self._pred_displ(im_feat).squeeze(-1)
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
@@ -691,6 +702,26 @@ class TDEEDModel(BaseRGBModel):
             return self._fc_out(x.reshape(batch_size * clip_len, -1)).view(
                 batch_size, clip_len, -1)
 
+    class CTHead(nn.Module):
+        """
+        Three independent sigmoid heads on top of temporal features.
+        Returns (B, L, 3) where dim-2 = [r_t, p_t, c_t].
+        """
+
+        def __init__(self, feat_dim: int):
+            super().__init__()
+            self._r = nn.Linear(feat_dim, 1)  # transition response
+            self._p = nn.Linear(feat_dim, 1)  # polarity (1=touch, 0=untouch)
+            self._c = nn.Linear(feat_dim, 1)  # contactness
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            B, L, _ = x.shape
+            flat = x.reshape(B * L, -1)
+            r = torch.sigmoid(self._r(flat)).reshape(B, L)
+            p = torch.sigmoid(self._p(flat)).reshape(B, L)
+            c = torch.sigmoid(self._c(flat)).reshape(B, L)
+            return torch.stack([r, p, c], dim=-1)  # (B, L, 3)
+
     def __init__(self, args=None):
         self.device = args.device
         self.amp = args.amp
@@ -702,11 +733,25 @@ class TDEEDModel(BaseRGBModel):
         self._model.to(self.device)
         self._num_classes = args.num_classes + 1
 
-        if args.loss_type == 'ce':
-            self.main_loss = BCELoss(fg_weight=args.fg_weight)
+        self._ct_mode = getattr(args, 'ct_mode', False)
 
-        elif args.loss_type == 'focal':
-            self.main_loss = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+        if not self._ct_mode:
+            if args.loss_type == 'ce':
+                self.main_loss = BCELoss(fg_weight=args.fg_weight)
+            elif args.loss_type == 'focal':
+                self.main_loss = FocalLoss(alpha=args.focal_alpha, gamma=args.focal_gamma)
+        else:
+            ct_cfg = getattr(args, 'ct_loss', {})
+            self.ct_loss_fn = CTLoss(
+                lambda_peak=ct_cfg.get('lambda_peak', 1.0),
+                lambda_bg=ct_cfg.get('lambda_bg', 0.3),
+                lambda_pol=ct_cfg.get('lambda_pol', 1.0),
+                lambda_rank=ct_cfg.get('lambda_rank', 0.5),
+                lambda_contact=ct_cfg.get('lambda_contact', 0.1),
+                focal_alpha=ct_cfg.get('focal_alpha', 0.25),
+                focal_gamma=ct_cfg.get('focal_gamma', 2.0),
+            )
+            print('[INFO] CT mode: using CTLoss.')
 
         if args.bi_interp_post:
             self.process_prediction = process_prediction
@@ -741,17 +786,51 @@ class TDEEDModel(BaseRGBModel):
 
         epoch_loss = 0.
         loss_dict = {'main_loss': 0., 'displ_loss': 0., 'grasp_loss': 0.}
+        ct_loss_dict = {'trans': 0., 'peak': 0., 'bg': 0., 'pol': 0., 'rank': 0., 'contact': 0.}
         with torch.no_grad() if optimizer is None else nullcontext():
             for batch_idx, batch in enumerate(tqdm(loader)):
                 frame = batch['frame'].to(self.device).float()
-                label = batch['label']
-                label = label.to(self.device)
 
                 left_patches = batch['left_patches'].to(self.device).float()
                 right_patches = batch['right_patches'].to(self.device).float()
 
                 left_grasp = batch['left_grasp'].to(self.device).float()
                 right_grasp = batch['right_grasp'].to(self.device).float()
+
+                # ── CT MODE FAST PATH ─────────────────────────────────────────
+                if self._ct_mode:
+                    y_r = batch['y_r'].to(self.device).float()
+                    m_r = batch['m_r'].to(self.device).float()
+                    y_p = batch['y_p'].to(self.device).float()
+                    m_p = batch['m_p'].to(self.device).float()
+                    y_c = batch['y_c'].to(self.device).float()
+                    m_c = batch['m_c'].to(self.device).float()
+
+                    with torch.amp.autocast(device_type=self.device, enabled=self.amp):
+                        preds, _ = self._model(
+                            frame, y=None,
+                            left_patches=left_patches, right_patches=right_patches,
+                            left_grasp=left_grasp, right_grasp=right_grasp,
+                            inference=inference,
+                        )
+                        ct_feat = preds['ct_feat']  # (B, L, 3) — already sigmoid
+                        loss, detail = self.ct_loss_fn(ct_feat, y_r, m_r, y_p, m_p, y_c, m_c)
+
+                    for k in ct_loss_dict:
+                        ct_loss_dict[k] += detail[k]
+
+                    if optimizer is not None:
+                        step(optimizer, scaler, loss / acc_grad_iter,
+                             lr_scheduler=lr_scheduler,
+                             backward_only=(batch_idx + 1) % acc_grad_iter != 0,
+                             max_norm=max_norm)
+
+                    epoch_loss += loss.detach().item()
+                    continue
+                # ── END CT MODE ───────────────────────────────────────────────
+
+                label = batch['label']
+                label = label.to(self.device)
 
                 ### Preparing for input, in case of using mixup or double heads ##########################################
 
@@ -886,6 +965,9 @@ class TDEEDModel(BaseRGBModel):
         if valMAP:
             return epoch_loss / len(loader), torch.cat(map_labels, 0), torch.cat(map_preds, 0)
 
+        if self._ct_mode:
+            return epoch_loss / len(loader), {k: v / len(loader) for k, v in ct_loss_dict.items()}
+
         return epoch_loss / len(loader), {k: v / len(loader) for k, v in loss_dict.items()}     # Avg loss
 
     def grasp_loss(self, pred_grasp, gt_grasp, is_valid, return_mean=True):
@@ -923,6 +1005,12 @@ class TDEEDModel(BaseRGBModel):
                                       left_grasp=left_grasp, right_grasp=right_grasp,
                                       inference=True, augment_inference=augment_inference)
             if isinstance(_pred, dict):
+                # ── CT MODE ──────────────────────────────────────────────────
+                if self._ct_mode and 'ct_feat' in _pred:
+                    ct_feat = _pred['ct_feat']  # (B, L, 3)
+                    raw_pred = {'ct_feat': ct_feat, 'feat': y}
+                    return ct_feat.cpu().numpy(), ct_feat.cpu().numpy(), raw_pred
+
                 pred = _pred['im_feat']
                 if isinstance(pred, list):
                     pred = pred[0]
