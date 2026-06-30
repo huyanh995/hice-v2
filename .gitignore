@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Checkpoints and cached data
+*.pt
+*.pkl
+checkpoints/
+
+# Experiment outputs
+save/
+store/
+wandb/
+
+# Environment
+.env
+*.egg-info/
+dist/
+build/
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+._*
