@@ -1010,8 +1010,9 @@ class TDEEDModel(BaseRGBModel):
                 # ── CT MODE ──────────────────────────────────────────────────
                 if self._ct_mode and 'ct_feat' in _pred:
                     ct_feat = torch.sigmoid(_pred['ct_feat'])  # logits → probs (B, L, 3)
-                    raw_pred = {'ct_feat': ct_feat, 'feat': y}
-                    return ct_feat.cpu().numpy(), ct_feat.cpu().numpy(), raw_pred
+                    ct_np = ct_feat.cpu().numpy()
+                    raw_pred = {'ct_feat': ct_np, 'feat': y}  # numpy so callers can += directly
+                    return ct_np, ct_np, raw_pred
 
                 pred = _pred['im_feat']
                 if isinstance(pred, list):
