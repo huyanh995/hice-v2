@@ -34,6 +34,7 @@ from util.score import gaussian_window
 DEFAULT_PAD_LEN = 5
 FPS_SN = 25
 ENLARGE_FACTOR = 1.2
+REVERSE_PROB = 0.3
 
 """
 ActionSpotDataset -> for training/validating
@@ -503,6 +504,15 @@ class ActionSpotDataset(Dataset):
         self._mixup = mixup
         assert mixup is False, '[ERROR] For hand-centric crop, mixup is not recommended to use.'
 
+        # Temporal reversal augmentation: reversed touch looks like untouch and vice versa.
+        # Build a swap map only when both classes coexist in this dataset.
+        touch_idx = self._class_dict.get('touch')
+        untouch_idx = self._class_dict.get('untouch')
+        if touch_idx is not None and untouch_idx is not None:
+            self._reverse_label_map = {touch_idx: untouch_idx, untouch_idx: touch_idx}
+        else:
+            self._reverse_label_map = {}
+
         # Frame reader class
         self._frame_reader = FrameReader(frame_dir, modality, dataset = dataset)
         self._hand_handler = HandAnnoHandler(scene_size=self._crop_dim, hand_size=self._hand_dim, is_training=True)
@@ -638,6 +648,23 @@ class ActionSpotDataset(Dataset):
                     labelsD[label['label_idx']] = label['displ']
                     if self._soft_labels:
                         labels[label['label_idx']] = self._gaussian_labels[label['displ']]
+
+        # Temporal reversal: reversed touch ↔ untouch (only when both classes exist)
+        if self._reverse_label_map and random.random() < REVERSE_PROB:
+            frames = frames.flip(0)
+            hands = hands[::-1]
+            if labels.ndim == 2:  # multi-class soft labels (L, C)
+                labels = labels[::-1].copy()
+                ti, ui = self._class_dict['touch'], self._class_dict['untouch']
+                labels[:, [ti, ui]] = labels[:, [ui, ti]]
+            else:
+                labels = labels[::-1].copy()
+                swapped = labels.copy()
+                for src, dst in self._reverse_label_map.items():
+                    swapped[labels == src] = dst
+                labels = swapped
+            if self._radi_displacement > 0:
+                labelsD = (-labelsD[::-1]).copy()
 
         clip_data = {'frame': frames,
                     'contains_event': int(np.sum(labels) > 0),
