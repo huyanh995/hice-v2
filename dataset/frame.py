@@ -609,7 +609,11 @@ class ActionSpotDataset(Dataset):
             # Multi-class soft labels: (L, C) — independent gaussian bell curve per class.
             # dict_label and dict_labelD are built in parallel in _store_clips so they
             # can be zipped to recover the (class, displacement) pair for each entry.
+            #
+            # Background column must start at 1.0 so the loss is non-zero on bg frames.
+            # (Zero bg target → zero CE → zero gradient; same bug as leaving bg implicit.)
             labels = np.zeros((self._clip_len, num_classes), np.float32)
+            labels[:, 0] = 1.0  # all frames start as background
 
             if self._radi_displacement > 0:
                 # Gaussian pass covers the full window including d=0 (peak=1.0),
@@ -624,6 +628,7 @@ class ActionSpotDataset(Dataset):
                 # No dilation: hard one-hot labels
                 for lbl in dict_label:
                     labels[lbl['label_idx'], lbl['label']] = 1.0
+                    labels[lbl['label_idx'], 0] = 0.0  # clear bg for fg frames
         else:
             # Binary soft (L,) float or hard (L,) int — existing behaviour
             labels = np.zeros(self._clip_len, np.int64)
