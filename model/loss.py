@@ -17,27 +17,42 @@ class BCELoss(nn.Module):
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        inputs:  (B, 2) logits = [bg, fg]
-        targets: (B,)  float in [0,1] (soft) or long {0,1} (hard)
+        inputs:  (B, C) logits; C=2 for binary, C>2 for multi-class
+        targets: (B,) float in [0,1] (binary soft) or long (hard), or
+                 (B, C) float distribution (multi-class soft)
         """
-        # ensure float targets in [0,1]
-        if targets.dtype == torch.long:
-            y = targets.float()
-        else:
-            y = targets
+        n_cls = inputs.shape[1]
+        logp = F.log_softmax(inputs, dim=1)           # (B, C)
 
-        logp = F.log_softmax(inputs, dim=1)           # (B,2)
-        # per-sample weighted CE with soft targets
-        loss = -((1 - y) * self.w_bg * logp[:, 0] +
-                  y       * self.w_fg * logp[:, 1])   # (B,)
+        if n_cls == 2:
+            # Binary path — targets is scalar float in [0,1] or long {0,1}
+            y = targets.float() if targets.dtype == torch.long else targets
+            loss = -((1 - y) * self.w_bg * logp[:, 0] +
+                      y       * self.w_fg * logp[:, 1])
+            if self.reduction == 'none':
+                return loss
+            if self.reduction == 'sum':
+                return loss.sum()
+            eff_w = (1 - y) * self.w_bg + y * self.w_fg
+            return loss.sum() / eff_w.sum().clamp_min(1e-8)
+
+        # Multi-class path — targets is (B,) long or (B, C) float distribution
+        if targets.dtype == torch.long:
+            y = F.one_hot(targets, n_cls).float()     # (B, C) one-hot
+        else:
+            y = targets                                # (B, C) soft distribution
+
+        w = torch.full((n_cls,), self.w_fg, device=inputs.device, dtype=logp.dtype)
+        w[0] = self.w_bg
+
+        loss = -(y * w * logp).sum(dim=1)             # (B,)
 
         if self.reduction == 'none':
             return loss
         if self.reduction == 'sum':
             return loss.sum()
 
-        # 'mean' — match PyTorch CE/NLL: divide by sum of weights of observed classes
-        eff_w = (1 - y) * self.w_bg + y * self.w_fg   # (B,)
+        eff_w = (y * w).sum(dim=1)
         return loss.sum() / eff_w.sum().clamp_min(1e-8)
 
 class FocalLoss(nn.Module):
@@ -63,31 +78,51 @@ class FocalLoss(nn.Module):
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        inputs:  (B,2) logits = [bg, fg]
-        targets: (B,) float in [0,1]  (hard or soft)
+        inputs:  (B, C) logits; C=2 for binary, C>2 for multi-class
+        targets: (B,) float in [0,1] (binary soft) or long (hard), or
+                 (B, C) float distribution (multi-class soft)
         """
-        y = targets.float()
-        # margin logit (log-odds of fg)
-        m = inputs[:, 1] - inputs[:, 0]                # (B,)
-        # stable BCE on logits
-        bce = F.binary_cross_entropy_with_logits(m, y, reduction="none")  # (B,), safe for amp
-        # probabilities
-        p = torch.sigmoid(m)                            # (B,)
-        p_t = y * p + (1 - y) * (1 - p)                # (B,)
-        mod = (1.0 - p_t).clamp_min(self.eps).pow(self.gamma)
+        n_cls = inputs.shape[1]
 
-        if self.alpha >= 0:
-            alpha_t = self.alpha * y + (1 - self.alpha) * (1 - y)  # (B,)
-            loss = alpha_t * mod * bce
+        if n_cls == 2:
+            # Binary path — stable margin-based formulation
+            y = targets.float()
+            m = inputs[:, 1] - inputs[:, 0]
+            bce = F.binary_cross_entropy_with_logits(m, y, reduction="none")
+            p = torch.sigmoid(m)
+            p_t = y * p + (1 - y) * (1 - p)
+            mod = (1.0 - p_t).clamp_min(self.eps).pow(self.gamma)
+            if self.alpha >= 0:
+                alpha_t = self.alpha * y + (1 - self.alpha) * (1 - y)
+                loss = alpha_t * mod * bce
+            else:
+                loss = mod * bce
         else:
-            loss = mod * bce
+            # Multi-class path — softmax-based focal loss
+            if targets.dtype == torch.long:
+                y = F.one_hot(targets, n_cls).float()  # (B, C) one-hot
+            else:
+                y = targets                             # (B, C) soft distribution
+
+            log_p = F.log_softmax(inputs, dim=1)
+            p = log_p.exp()
+            p_t = (y * p).sum(dim=1)                   # expected prob of true class(es)
+            ce = -(y * log_p).sum(dim=1)               # soft CE over all classes
+            mod = (1.0 - p_t).clamp_min(self.eps).pow(self.gamma)
+
+            if self.alpha >= 0:
+                # alpha weights fg mass vs bg mass
+                alpha_t = self.alpha * (1 - y[:, 0]) + (1 - self.alpha) * y[:, 0]
+                loss = alpha_t * mod * ce
+            else:
+                loss = mod * ce
 
         if self.reduction == "mean":
             return loss.mean()
         elif self.reduction == "sum":
             return loss.sum()
         else:
-            return loss  # 'none'
+            return loss
 
 class FocalLossPlain(nn.Module):
     """

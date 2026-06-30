@@ -119,21 +119,29 @@ def auto_detect_videos(frame_dir):
     return videos
 
 
+FEAT_DIM = 768
+
 def run_inference(model, dataset, classes):
     pred_dict = {}
+    feat_dict = {}
     for video, video_len, _ in dataset.videos:
         pred_dict[video] = (
             np.zeros((video_len, len(classes) + 1), np.float32),
+            np.zeros(video_len, np.int32))
+        feat_dict[video] = (
+            np.zeros((video_len, FEAT_DIM), np.float32),
             np.zeros(video_len, np.int32))
 
     print(f'[INFO] Inference batch size: {BATCH_SIZE}')
     dataloader = DataLoader(dataset, num_workers=8, pin_memory=True, batch_size=BATCH_SIZE)
 
     for clip in tqdm(dataloader, desc='Inference'):
-        _, batch_scores, _ = model.predict(
+        _, batch_scores, raw_pred = model.predict(
             clip['frame'],
             clip['left_patches'], clip['right_patches'],
             clip['left_grasp'],   clip['right_grasp'])
+
+        batch_feats = raw_pred['feat']['temporal'].numpy()  # (B, L, 768)
 
         for i in range(clip['frame'].shape[0]):
             video = clip['video'][i]
@@ -150,7 +158,19 @@ def run_inference(model, dataset, classes):
             scores[start:end, :] += pred_scores
             support[start:end] += (pred_scores.sum(axis=1) != 0) * 1
 
-    return pred_dict
+            # Accumulate 768-dim features with the same clip window
+            feats, feat_support = feat_dict[video]
+            clip_feat = batch_feats[i]
+            clip_start = clip['start'][i].item()
+            if clip_start < 0:
+                clip_feat = clip_feat[-clip_start:, :]
+                clip_start = 0
+            feat_end = min(clip_start + clip_feat.shape[0], feats.shape[0])
+            clip_feat = clip_feat[:feat_end - clip_start, :]
+            feats[clip_start:feat_end, :] += clip_feat
+            feat_support[clip_start:feat_end] += 1
+
+    return pred_dict, feat_dict
 
 
 def apply_threshold(pred_events, threshold):
@@ -224,7 +244,15 @@ def main():
     print(f'[INFO] Loaded checkpoint: {args_cli.checkpoint}')
 
     # Run inference
-    pred_dict = run_inference(model, dataset, classes)
+    pred_dict, feat_dict = run_inference(model, dataset, classes)
+
+    # Save per-frame 768-dim features (one .npy per video)
+    feat_dir = os.path.join(args_cli.out, 'features')
+    os.makedirs(feat_dir, exist_ok=True)
+    for video, (feats, feat_support) in feat_dict.items():
+        feat_support[feat_support == 0] = 1
+        np.save(os.path.join(feat_dir, f'{video}.npy'), feats / feat_support[:, None])
+    print(f'[INFO] Saved per-frame features ({FEAT_DIM}-d) to {feat_dir}')
 
     # Build high-recall predictions (>= 0.01) for mAP
     _, _, _, pred_raw, _ = process_frame_predictions(

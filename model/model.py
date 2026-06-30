@@ -939,6 +939,7 @@ class TDEEDModel(BaseRGBModel):
                         pred = self.process_prediction(pred, predD)
 
                 raw_pred['pred'] = pred
+                raw_pred['feat'] = y  # feat_save dict; 'temporal' key has (B, L, 768) pre-cls-head features
                 pred_cls = torch.argmax(pred, axis=2)
                 return pred_cls.cpu().numpy(), pred.cpu().numpy(), raw_pred
 

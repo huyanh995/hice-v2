@@ -603,12 +603,41 @@ class ActionSpotDataset(Dataset):
         frames, hands = self._frame_reader.load_frames(frames_path, pad=True, stride=self._stride)
 
         # Process labels
-        labels = np.zeros(self._clip_len, np.int64)
-        if self._soft_labels:
-            labels = labels.astype(np.float32)
+        num_classes = len(self._class_dict) + 1  # bg + all fg classes
 
-        for label in dict_label:
-            labels[label['label_idx']] = label['label']
+        if self._soft_labels and num_classes > 2:
+            # Multi-class soft labels: (L, C) — independent gaussian bell curve per class.
+            # dict_label and dict_labelD are built in parallel in _store_clips so they
+            # can be zipped to recover the (class, displacement) pair for each entry.
+            labels = np.zeros((self._clip_len, num_classes), np.float32)
+
+            if self._radi_displacement > 0:
+                # Gaussian pass covers the full window including d=0 (peak=1.0),
+                # so no separate initial pass needed.
+                labelsD = np.zeros(self._clip_len, np.int64)
+                for lbl, lblD in zip(dict_label, dict_labelD):
+                    i, c, d = lbl['label_idx'], lbl['label'], lblD['displ']
+                    labelsD[i] = d
+                    labels[i, c] = max(labels[i, c], self._gaussian_labels[d])
+                    labels[i, 0] = 0.0  # bg=0 whenever any fg class is active
+            else:
+                # No dilation: hard one-hot labels
+                for lbl in dict_label:
+                    labels[lbl['label_idx'], lbl['label']] = 1.0
+        else:
+            # Binary soft (L,) float or hard (L,) int — existing behaviour
+            labels = np.zeros(self._clip_len, np.int64)
+            if self._soft_labels:
+                labels = labels.astype(np.float32)
+            for label in dict_label:
+                labels[label['label_idx']] = label['label']
+
+            if self._radi_displacement > 0:
+                labelsD = np.zeros(self._clip_len, np.int64)
+                for label in dict_labelD:
+                    labelsD[label['label_idx']] = label['displ']
+                    if self._soft_labels:
+                        labels[label['label_idx']] = self._gaussian_labels[label['displ']]
 
         clip_data = {'frame': frames,
                     'contains_event': int(np.sum(labels) > 0),
@@ -617,11 +646,6 @@ class ActionSpotDataset(Dataset):
                     }
 
         if self._radi_displacement > 0:
-            labelsD = np.zeros(self._clip_len, np.int64)
-            for label in dict_labelD:
-                labelsD[label['label_idx']] = label['displ']
-                if self._soft_labels:
-                    labels[label['label_idx']] = self._gaussian_labels[label['displ']]
             clip_data['labelD'] = labelsD
 
         return clip_data
