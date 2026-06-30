@@ -715,12 +715,14 @@ class TDEEDModel(BaseRGBModel):
             self._c = nn.Linear(feat_dim, 1)  # contactness
 
         def forward(self, x: torch.Tensor) -> torch.Tensor:
+            # Returns raw logits — sigmoid is applied in CTLoss (via bce_with_logits)
+            # and in predict() for inference.  Do NOT sigmoid here; unsafe under AMP.
             B, L, _ = x.shape
             flat = x.reshape(B * L, -1)
-            r = torch.sigmoid(self._r(flat)).reshape(B, L)
-            p = torch.sigmoid(self._p(flat)).reshape(B, L)
-            c = torch.sigmoid(self._c(flat)).reshape(B, L)
-            return torch.stack([r, p, c], dim=-1)  # (B, L, 3)
+            r = self._r(flat).reshape(B, L)
+            p = self._p(flat).reshape(B, L)
+            c = self._c(flat).reshape(B, L)
+            return torch.stack([r, p, c], dim=-1)  # (B, L, 3) logits
 
     def __init__(self, args=None):
         self.device = args.device
@@ -1007,7 +1009,7 @@ class TDEEDModel(BaseRGBModel):
             if isinstance(_pred, dict):
                 # ── CT MODE ──────────────────────────────────────────────────
                 if self._ct_mode and 'ct_feat' in _pred:
-                    ct_feat = _pred['ct_feat']  # (B, L, 3)
+                    ct_feat = torch.sigmoid(_pred['ct_feat'])  # logits → probs (B, L, 3)
                     raw_pred = {'ct_feat': ct_feat, 'feat': y}
                     return ct_feat.cpu().numpy(), ct_feat.cpu().numpy(), raw_pred
 

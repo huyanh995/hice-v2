@@ -228,10 +228,11 @@ class CTLoss(nn.Module):
     # Internal helpers
     # ------------------------------------------------------------------
 
-    def _focal_bce(self, r: torch.Tensor, y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
-        """Focal BCE on r, masked by m (0 = ignore)."""
-        bce = F.binary_cross_entropy(r, y, reduction='none')  # r already sigmoid
-        p_t = y * r + (1 - y) * (1 - r)
+    def _focal_bce(self, logit: torch.Tensor, prob: torch.Tensor,
+                   y: torch.Tensor, m: torch.Tensor) -> torch.Tensor:
+        """Focal BCE on logit (AMP-safe), masked by m. prob = sigmoid(logit)."""
+        bce = F.binary_cross_entropy_with_logits(logit, y, reduction='none')
+        p_t = y * prob + (1 - y) * (1 - prob)
         mod = (1.0 - p_t.clamp_min(1e-8)).pow(self.gamma)
         alpha_t = self.alpha * y + (1 - self.alpha) * (1 - y)
         loss = alpha_t * mod * bce * m
@@ -320,7 +321,7 @@ class CTLoss(nn.Module):
 
     def forward(
         self,
-        ct_feat: torch.Tensor,  # (B, L, 3): [r_t, p_t, c_t] after sigmoid
+        ct_feat: torch.Tensor,  # (B, L, 3): [r_t, p_t, c_t] raw logits from CTHead
         y_r: torch.Tensor,      # (B, L)
         m_r: torch.Tensor,      # (B, L)
         y_p: torch.Tensor,      # (B, L)
@@ -328,11 +329,17 @@ class CTLoss(nn.Module):
         y_c: torch.Tensor,      # (B, L)
         m_c: torch.Tensor,      # (B, L)
     ):
-        r = ct_feat[:, :, 0]  # (B, L)
-        p = ct_feat[:, :, 1]
-        c = ct_feat[:, :, 2]
+        r_logit = ct_feat[:, :, 0]  # (B, L) raw logits
+        p_logit = ct_feat[:, :, 1]
+        c_logit = ct_feat[:, :, 2]
 
-        L_trans = self._focal_bce(r, y_r, m_r)
+        # Sigmoid probabilities needed for prob-based ops (peak, bg, ranking).
+        # Computed in float32 to stay numerically stable; detach not needed.
+        r = torch.sigmoid(r_logit.float())
+        p = torch.sigmoid(p_logit.float())
+        c = torch.sigmoid(c_logit.float())
+
+        L_trans = self._focal_bce(r_logit.float(), r, y_r, m_r)
         L_peak = self._peak_contrast(r, y_r, m_r)
 
         bg_mask = (y_r == 0.0) & (m_r == 1.0)
@@ -340,12 +347,14 @@ class CTLoss(nn.Module):
         L_bg = (r * bg_mask.float()).sum() / bg_sum
 
         pol_denom = m_p.sum().clamp_min(1)
-        L_pol = (F.binary_cross_entropy(p, y_p, reduction='none') * m_p).sum() / pol_denom
+        L_pol = (F.binary_cross_entropy_with_logits(
+            p_logit.float(), y_p, reduction='none') * m_p).sum() / pol_denom
 
         L_rank = self._ranking_loss(c, y_r, y_p, m_r)
 
         con_denom = m_c.sum().clamp_min(1)
-        L_contact = (F.binary_cross_entropy(c, y_c, reduction='none') * m_c).sum() / con_denom
+        L_contact = (F.binary_cross_entropy_with_logits(
+            c_logit.float(), y_c, reduction='none') * m_c).sum() / con_denom
 
         total = (
             L_trans
