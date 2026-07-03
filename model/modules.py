@@ -47,7 +47,8 @@ class BaseRGBModel(ABCModel):
         else:
             optimizer = base_optimizer(self._get_params(), **opt_args)
 
-        grad_scaler = torch.amp.GradScaler(device=self.device, enabled=self.amp) # supported for cpu though benefits are unclear.
+        # bf16 has fp32's exponent range, so loss scaling (needed to counter fp16 underflow) is unnecessary here.
+        grad_scaler = torch.amp.GradScaler(device=self.device, enabled=False)
 
         return optimizer, grad_scaler
 

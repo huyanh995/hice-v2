@@ -271,6 +271,11 @@ def main(args):
     os.makedirs(args.save_dir, exist_ok=True)
     store_json(os.path.join(args.save_dir, 'config.json'), args.__dict__, pretty=True)
 
+    # Per-epoch checkpoints (kept alongside checkpoint_best.pt/checkpoint_last.pt) so a
+    # crash mid-training can be reproduced from the exact epoch it happened at.
+    checkpoints_dir = os.path.join(args.save_dir, 'checkpoints')
+    os.makedirs(checkpoints_dir, exist_ok=True)
+
     # initialize wandb
     wandb.login()
     wandb.init(project = 'Ego-Touch-TDEED',
@@ -364,7 +369,8 @@ def main(args):
                     lr_scheduler=lr_scheduler,
                     acc_grad_iter=args.acc_grad_iter,
                     # fg_weight=args.fg_weight,
-                    max_norm=args.clip_grad)
+                    max_norm=args.clip_grad,
+                    epoch=epoch)
             else:
                 train_loss = model.epoch_sam(train_loader, optimizer,
                                              lr_scheduler=lr_scheduler,
@@ -375,7 +381,7 @@ def main(args):
 
             val_loss, val_loss_dict = model.epoch(val_loader, acc_grad_iter=args.acc_grad_iter,
                                    # fg_weight=args.fg_weight
-                                   )
+                                   epoch=epoch)
 
             better = False
             val_mAP = 0
@@ -424,7 +430,9 @@ def main(args):
                 'train': train_loss,
                 'val': val_loss,
                 'val_mAP': val_mAP,
-                'lr': current_lr
+                'lr': current_lr,
+                **{f'train_{k}': v for k, v in train_loss_dict.items()},
+                **{f'val_{k}': v for k, v in val_loss_dict.items()},
             })
 
             if args.save_dir is not None:
@@ -443,6 +451,15 @@ def main(args):
                             'scaler_state_dict': scaler.state_dict(),
                             'lr_state_dict': lr_scheduler.state_dict()},
                            os.path.join(os.getcwd(), args.save_dir, 'checkpoint_last.pt'))
+
+                # Save every epoch under checkpoints/ so a crash can be reproduced from the
+                # exact epoch it happened at.
+                torch.save({'epoch': epoch,
+                            'model_state_dict': model.state_dict(),
+                            'optimizer_state_dict': optimizer.state_dict(),
+                            'scaler_state_dict': scaler.state_dict(),
+                            'lr_state_dict': lr_scheduler.state_dict()},
+                           os.path.join(os.getcwd(), checkpoints_dir, f'checkpoint_epoch{epoch:03d}.pt'))
 
             # Log to wandb
             if (args.criterion == 'map'):

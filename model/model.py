@@ -333,7 +333,11 @@ class TDEEDModel(BaseRGBModel):
             if self._obj_head:
                 obj_logits = self._obj_heatmap_head(im_feat)  # (B*L, 1, 7, 7)
                 obj_logits_flat = obj_logits.flatten(2)  # (B*L, 1, 49)
-                attn = torch.softmax(obj_logits_flat, dim=-1)  # (B*L, 1, 49) -- spatial attn only, no trust role
+                # attn = torch.softmax(obj_logits_flat, dim=-1)  # (B*L, 1, 49) -- spatial attn only, no trust role
+                prob = torch.sigmoid(obj_logits.float())
+                weights = prob.flatten(2)
+                attn = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+
                 f_obj = torch.bmm(im_feat.flatten(2), attn.transpose(1, 2)).squeeze(-1)  # (B*L, C)
 
                 f_global = self.cls_head(im_feat).reshape(B * L, self._d)  # (B*L, 768)
@@ -777,7 +781,7 @@ class TDEEDModel(BaseRGBModel):
 
 
     def epoch(self, loader, optimizer=None, scaler=None, lr_scheduler=None,
-            acc_grad_iter=1, fg_weight=5, valMAP=False, max_norm=None):
+            acc_grad_iter=1, fg_weight=5, valMAP=False, max_norm=None, epoch=None):
 
         if optimizer is None:
             inference = True
@@ -814,9 +818,16 @@ class TDEEDModel(BaseRGBModel):
                 right_grasp = batch['right_grasp'].to(self.device).float()
 
                 if self._args.obj_head:
+                    # A heat map of the object location. From 224 x 224 → 56 x 56 → 7 x 7. The model will learn to predict this heat map.
                     obj_target = batch['obj_target'].to(self.device).float()  # (B, L, 7, 7)
+
+                    # Whether or not the heatmap contains a valid object, to distinguish with padding frames
                     obj_valid = batch['obj_valid'].to(self.device).float()    # (B, L)
+
+                    # Precense label derived from obj_target, if obj_target.max() > precense_tau (0.1), then precense = 1, else 0.
                     y_obj = batch['y_obj'].to(self.device).float()            # (B, L)
+
+                    # Whether or not the the precense is to use for loss or
                     y_obj_valid = batch['y_obj_valid'].to(self.device).float()  # (B, L)
 
                 ### Preparing for input, in case of using mixup or double heads ##########################################
@@ -867,8 +878,14 @@ class TDEEDModel(BaseRGBModel):
                 label = label.flatten() if len(label.shape) == 2 \
                     else label.view(-1, label.shape[-1])
 
+                assert torch.isfinite(frame).all(), f"NaN/inf in frames, batch {batch_idx}"
+                if self._args.obj_head:
+                    assert torch.isfinite(obj_target).all(), f"NaN/inf in obj_target, batch {batch_idx}"
+                if 'labelD' in batch.keys():
+                    assert torch.isfinite(labelD).all(), f"NaN/inf in labelD, batch {batch_idx}"
+
                 ### Main logic of model forward pass ##########################################
-                with torch.amp.autocast(device_type = self.device, enabled = self.amp):
+                with torch.amp.autocast(device_type = self.device, dtype = torch.bfloat16, enabled = self.amp):
                     # pred, y = self._model(frame, y = label, inference=inference)
                     preds, y = self._model(frame, y = label,
                                             left_patches=left_patches, right_patches=right_patches,
@@ -984,6 +1001,9 @@ class TDEEDModel(BaseRGBModel):
                         else:
                             loss += self._args.obj_loss_weight * obj_loss
 
+                if not torch.isfinite(loss):
+                    raise RuntimeError(f"non-finite loss at batch {batch_idx}, epoch {epoch}")
+
                 if optimizer is not None:
                     step(optimizer, scaler, loss / acc_grad_iter,
                         lr_scheduler=lr_scheduler,
@@ -1036,7 +1056,7 @@ class TDEEDModel(BaseRGBModel):
 
         self._model.eval()
         with torch.no_grad():
-            with torch.amp.autocast('cuda') if use_amp else nullcontext():
+            with torch.amp.autocast('cuda', dtype = torch.bfloat16) if use_amp else nullcontext():
                 _pred, y = self._model(seq, y=None,
                                       left_patches=left_patches, right_patches=right_patches,
                                       left_grasp=left_grasp, right_grasp=right_grasp,
