@@ -27,10 +27,10 @@ temporal_shift: true
 # Omit --stage entirely to train end-to-end (fusion from scratch, no warm start)
 # as a free ablation row -- no separate config needed for that either.
 #
-# Object annotations live at Object_Annotations/HOI4D-v3_object_bbox.json (named for
+# Object annotations live at data/HOI4D-v3/object_bbox.json (named for
 # HOI4D-v3, which reuses the exact same underlying videos as this plain-HOI4D config,
 # just with untouch events added) -- obj_anno_dataset points the loader there instead
-# of needing a separate HOI4D_object_bbox.json copy.
+# of needing a separate data/HOI4D/object_bbox.json copy.
 obj_head: true
 obj_anno_dataset: HOI4D-v3
 obj_loss_weight: 0.15    # lambda_obj: weight of (heatmap + presence) loss vs main HiCE loss

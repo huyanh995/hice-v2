@@ -915,7 +915,7 @@ class FrameReader:
             # different event labels) point at one shared annotation file instead of each
             # needing its own multi-hundred-MB duplicate.
             anno_name = obj_anno_dataset or dataset
-            obj_anno_path = os.path.join('Object_Annotations', f'{anno_name}_object_bbox.json')
+            obj_anno_path = os.path.join('data', anno_name, 'object_bbox.json')
             if not os.path.exists(obj_anno_path):
                 raise FileNotFoundError(
                     f'[ERROR] --obj_head enabled but object annotation file not found: {obj_anno_path}')

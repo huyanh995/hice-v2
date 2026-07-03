@@ -27,7 +27,7 @@ temporal_shift: true
 # Omit --stage entirely to train end-to-end (fusion from scratch, no warm start)
 # as a free ablation row -- no separate config needed for that either.
 #
-# Object annotations live at Object_Annotations/HOI4D-v3_object_bbox.json, matching
+# Object annotations live at data/HOI4D-v3/object_bbox.json, matching
 # this config's dataset name directly -- no obj_anno_dataset override needed. (HOI4D-v3
 # reuses the exact same underlying videos as plain HOI4D, just with untouch events
 # added; the plain-HOI4D config points obj_anno_dataset at this same file instead of
