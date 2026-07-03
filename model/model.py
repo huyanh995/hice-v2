@@ -801,6 +801,7 @@ class TDEEDModel(BaseRGBModel):
                 [1] + [fg_weight] * (self._num_classes - 1)).to(self.device)
 
         epoch_loss = 0.
+        valid_batches = 0
         loss_dict = {'main_loss': 0., 'displ_loss': 0., 'grasp_loss': 0., 'obj_loss': 0.,
                      'presence_loss': 0.,
                      'presence_pos_correct': 0., 'presence_pos_total': 0.,
@@ -901,6 +902,10 @@ class TDEEDModel(BaseRGBModel):
                         map_preds.append(pred_aux.cpu())
 
                     loss = 0.
+                    # Buffered here, merged into loss_dict only once `loss` is confirmed
+                    # finite below -- otherwise a skipped non-finite val batch would still
+                    # leave a NaN/inf term baked into the epoch's per-component sums.
+                    batch_stats = {}
 
                     if self._model._double_head:
                         b, t, c = pred.shape
@@ -938,7 +943,7 @@ class TDEEDModel(BaseRGBModel):
                         # loss += F.cross_entropy(predictions, label, **ce_kwargs)
                         main_loss = self.main_loss(predictions, label)
                         loss += main_loss
-                        loss_dict['main_loss'] += main_loss.detach().item()
+                        batch_stats['main_loss'] = main_loss.detach().item()
 
                         if self._args.grasp_loss:
                             _, _, C = left_grasp.shape
@@ -948,13 +953,13 @@ class TDEEDModel(BaseRGBModel):
                                 torch.cat([preds['left_valid'], preds['right_valid']], dim=0)
                             )
                             loss += grasp_loss
-                            loss_dict['grasp_loss'] += grasp_loss.detach().item()
+                            batch_stats['grasp_loss'] = grasp_loss.detach().item()
 
                     if 'labelD' in batch.keys():
                         lossD = F.mse_loss(predD, labelD, reduction = 'none')
                         lossD = (lossD).mean()
                         loss += lossD
-                        loss_dict['displ_loss'] += lossD.detach().item()
+                        batch_stats['displ_loss'] = lossD.detach().item()
 
                     if self._args.obj_head:
                         obj_logits = preds['obj_heatmap']  # (B, L, 7, 7)
@@ -967,7 +972,7 @@ class TDEEDModel(BaseRGBModel):
                         obj_loss_raw = obj_loss_raw.mean(dim=(2, 3))  # (B, L) per-cell mean BCE per frame
                         denom = obj_valid.sum().clamp_min(1.0)
                         heatmap_loss = (obj_loss_raw * obj_valid).sum() / denom
-                        loss_dict['obj_loss'] += heatmap_loss.detach().item()
+                        batch_stats['obj_loss'] = heatmap_loss.detach().item()
 
                         # Presence/trust gate supervision (change note sec 3): masked scalar
                         # BCE against y_obj, derived from the same rendered grid via a
@@ -978,7 +983,7 @@ class TDEEDModel(BaseRGBModel):
                             presence_logits, y_obj, reduction='none')  # (B, L)
                         presence_denom = y_obj_valid.sum().clamp_min(1.0)
                         presence_loss = (presence_loss_raw * y_obj_valid).sum() / presence_denom
-                        loss_dict['presence_loss'] += presence_loss.detach().item()
+                        batch_stats['presence_loss'] = presence_loss.detach().item()
 
                         obj_loss = heatmap_loss + self._args.lambda_presence * presence_loss
 
@@ -987,10 +992,10 @@ class TDEEDModel(BaseRGBModel):
                             pos_mask = valid_mask & (y_obj > 0.5)
                             neg_mask = valid_mask & (y_obj <= 0.5)
                             pred_bin = (q_obj > 0.5).float()
-                            loss_dict['presence_pos_correct'] += (pred_bin[pos_mask] == y_obj[pos_mask]).sum().item()
-                            loss_dict['presence_pos_total'] += pos_mask.sum().item()
-                            loss_dict['presence_neg_correct'] += (pred_bin[neg_mask] == y_obj[neg_mask]).sum().item()
-                            loss_dict['presence_neg_total'] += neg_mask.sum().item()
+                            batch_stats['presence_pos_correct'] = (pred_bin[pos_mask] == y_obj[pos_mask]).sum().item()
+                            batch_stats['presence_pos_total'] = pos_mask.sum().item()
+                            batch_stats['presence_neg_correct'] = (pred_bin[neg_mask] == y_obj[neg_mask]).sum().item()
+                            batch_stats['presence_neg_total'] = neg_mask.sum().item()
 
                         if self._args.obj_stage1:
                             # Stage 1: localization-only -- heatmap + presence loss is the
@@ -1002,7 +1007,20 @@ class TDEEDModel(BaseRGBModel):
                             loss += self._args.obj_loss_weight * obj_loss
 
                 if not torch.isfinite(loss):
-                    raise RuntimeError(f"non-finite loss at batch {batch_idx}, epoch {epoch}")
+                    if optimizer is not None:
+                        # Training: a non-finite loss can poison BN running stats via the
+                        # backward/step that would follow -- die loudly rather than risk
+                        # silently corrupting the rest of the run.
+                        raise RuntimeError(f"non-finite loss at batch {batch_idx}, epoch {epoch}")
+                    # Val: eval-mode BN doesn't update running stats, so a transient
+                    # non-finite val loss is harmless noise -- skip the batch instead of
+                    # killing an otherwise-healthy run. Skip merging batch_stats too, so
+                    # this batch's NaN/inf doesn't poison the epoch's per-component sums.
+                    print(f"[WARN] non-finite VAL loss at batch {batch_idx}, epoch {epoch} -- skipping batch")
+                    continue
+
+                for k, v in batch_stats.items():
+                    loss_dict[k] += v
 
                 if optimizer is not None:
                     step(optimizer, scaler, loss / acc_grad_iter,
@@ -1011,6 +1029,7 @@ class TDEEDModel(BaseRGBModel):
                         max_norm=max_norm)
 
                 epoch_loss += loss.detach().item()
+                valid_batches += 1
 
                 # break # DEBUG
 
@@ -1019,13 +1038,17 @@ class TDEEDModel(BaseRGBModel):
 
         # presence_*_correct/total are raw counts accumulated across the whole epoch (not
         # per-batch means), since batches can have zero pos/neg frames -- divide into exact
-        # epoch-level accuracies here instead of the generic /len(loader) averaging below.
+        # epoch-level accuracies here instead of the generic /valid_batches averaging below.
+        # Divide by valid_batches (not len(loader)): batches skipped for a non-finite val
+        # loss never got merged into loss_dict, so averaging over them would silently
+        # deflate the reported loss.
+        denom = max(1, valid_batches)
         count_keys = ('presence_pos_correct', 'presence_pos_total', 'presence_neg_correct', 'presence_neg_total')
-        avg_loss_dict = {k: v / len(loader) for k, v in loss_dict.items() if k not in count_keys}
+        avg_loss_dict = {k: v / denom for k, v in loss_dict.items() if k not in count_keys}
         avg_loss_dict['presence_acc_pos'] = loss_dict['presence_pos_correct'] / max(1., loss_dict['presence_pos_total'])
         avg_loss_dict['presence_acc_neg'] = loss_dict['presence_neg_correct'] / max(1., loss_dict['presence_neg_total'])
 
-        return epoch_loss / len(loader), avg_loss_dict     # Avg loss
+        return epoch_loss / denom, avg_loss_dict     # Avg loss
 
     def grasp_loss(self, pred_grasp, gt_grasp, is_valid, return_mean=True):
         loss_grasp = F.cross_entropy(pred_grasp, gt_grasp, reduction='none')
