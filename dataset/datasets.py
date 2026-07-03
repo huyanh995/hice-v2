@@ -36,7 +36,8 @@ def get_datasets(args):
 
     dataset_kwargs = {
         'stride': stride, 'overlap': overlap, 'radi_displacement': args.radi_displacement,
-        'mixup': args.mixup, 'dataset': args.dataset
+        'mixup': args.mixup, 'dataset': args.dataset, 'obj_head': args.obj_head,
+        'presence_tau': args.presence_tau, 'obj_anno_dataset': args.obj_anno_dataset,
     }
 
     print('[INFO] Dataset size:', dataset_len)

@@ -41,6 +41,29 @@ ActionSpotDataset -> for training/validating
 ActionSpotVideoDataset -> for testing
 
 """
+
+def render_obj_target(boxes_xyxy, crop_xyxy, mask=None, out=7, inter=8):
+    """Rasterize candidate-object boxes/mask into a soft 7x7 coverage target.
+
+    boxes in original frame coords; crop_xyxy = (x0,y0,x1,y1) of the hand-based crop.
+    Coordinate-only transform, so crop_xyxy may extend outside the frame (e.g. when
+    the crop needed padding) -- that's fine, only relative geometry matters here.
+    """
+    R = out * inter  # 56
+    occ = np.zeros((R, R), dtype=np.float32)
+    x0, y0, x1, y1 = crop_xyxy
+    sx, sy = R / (x1 - x0), R / (y1 - y0)
+    if mask is not None:  # mask-supervised path (e.g. HOI4D segmentation, if available)
+        m = mask[int(y0):int(y1), int(x0):int(x1)]
+        occ = cv2.resize(m.astype(np.float32), (R, R), interpolation=cv2.INTER_NEAREST)
+    else:  # box-supervised path
+        for bx0, by0, bx1, by1 in boxes_xyxy:
+            gx0 = np.clip((bx0 - x0) * sx, 0, R); gx1 = np.clip((bx1 - x0) * sx, 0, R)
+            gy0 = np.clip((by0 - y0) * sy, 0, R); gy1 = np.clip((by1 - y0) * sy, 0, R)
+            occ[int(gy0):int(np.ceil(gy1)), int(gx0):int(np.ceil(gx1))] = 1.0
+    return occ.reshape(out, inter, out, inter).mean(axis=(1, 3))  # (7,7) in [0,1]
+
+
 class HandAnnoHandler:
     """
     A class to handle the hand annotation logic, centralized.
@@ -55,7 +78,8 @@ class HandAnnoHandler:
     """
 
     def __init__(self, scene_size=224, hand_size=224,
-                is_training=True, flip_prob=0.5, hand_crop_prob=0.8, enlarge_factor=ENLARGE_FACTOR):
+                is_training=True, flip_prob=0.5, hand_crop_prob=0.8, enlarge_factor=ENLARGE_FACTOR,
+                obj_head=False, presence_tau=0.1):
         self.scene_size = scene_size
         self.hand_size = hand_size
         self.is_training = is_training
@@ -63,6 +87,8 @@ class HandAnnoHandler:
         self.hand_crop_prob = hand_crop_prob
         self.enlarge_factor = enlarge_factor
         self.center_crop = T.CenterCrop((self.scene_size, self.scene_size))
+        self.obj_head = obj_head
+        self.presence_tau = presence_tau
 
         print(f'[INFO] Enlarge factor: {self.enlarge_factor}')
 
@@ -72,6 +98,7 @@ class HandAnnoHandler:
         frames = ret['frame'] # expect (L, C, H, W)
         hands_sequence = ret['hands']
         del ret['hands']
+        objects_sequence = ret.pop('objects', None) if self.obj_head else None
         if 'intrinsic' in ret:
             del ret['intrinsic']
         _, _, H, W = frames.shape
@@ -79,7 +106,8 @@ class HandAnnoHandler:
         # Cropping frames, only in training
         if self.is_training:
             if random.random() > self.flip_prob:
-                frames, hands_sequence = self.horizontal_flip(frames, hands_sequence)
+                frames, hands_sequence, objects_sequence = self.horizontal_flip(
+                    frames, hands_sequence, objects_sequence)
 
             # Cropping frames =======
             hand_prob = self.get_hand_prob(hands_sequence, H, W)
@@ -108,6 +136,17 @@ class HandAnnoHandler:
 
             ret['frame'] = self.crop_frames(frames, x, y)
 
+            if self.obj_head:
+                # Same intended (pre-pad) crop box crop_frames() computes internally;
+                # object-target rendering is coordinate-only so pre-pad box is correct
+                # even when the crop spills outside the frame.
+                half_f = self.scene_size / 2.0
+                x0 = int(round(x - half_f))
+                y0 = int(round(y - half_f))
+                crop_xyxy = (x0, y0, x0 + self.scene_size, y0 + self.scene_size)
+                (ret['obj_target'], ret['obj_valid'],
+                 ret['y_obj'], ret['y_obj_valid']) = self.render_obj_targets(objects_sequence, crop_xyxy)
+
         else:
             # Center cropping
             ret['frame'] = self.center_crop(frames)
@@ -116,6 +155,44 @@ class HandAnnoHandler:
         ret.update(self.crop_hand_patches(frames, hands_sequence))
 
         return ret
+
+    def render_obj_targets(self, objects_sequence, crop_xyxy):
+        """
+        objects_sequence: list (len L) of either None (unannotated/padding frame)
+        or a list of [x1,y1,x2,y2] boxes in original-frame coords (possibly empty).
+
+        Also derives the presence target y_obj/y_obj_valid from the same rendered
+        grid (change note sec 3): thresholded against presence_tau with a dead zone
+        for borderline slivers, rather than "any positive cell" -- a 2%-visible sliver
+        at the crop edge would otherwise count as "present" despite the pooled readout
+        being garbage. Frames with no annotation at all (objs is None) get no presence
+        supervision either (y_obj_valid=0), same as they get no heatmap supervision.
+        """
+        targets, valids, y_objs, y_obj_valids = [], [], [], []
+        for objs in objects_sequence:
+            if objs is None:
+                targets.append(np.zeros((7, 7), dtype=np.float32))
+                valids.append(0.0)
+                y_objs.append(0.0)
+                y_obj_valids.append(0.0)
+            else:
+                target = render_obj_target(objs, crop_xyxy)
+                targets.append(target)
+                valids.append(1.0)
+
+                peak = float(target.max())
+                if peak == 0:
+                    y_obj, y_obj_valid = 0.0, 1.0       # nothing in crop
+                elif peak > self.presence_tau:
+                    y_obj, y_obj_valid = 1.0, 1.0       # usable object visible
+                else:
+                    y_obj, y_obj_valid = 0.0, 0.0       # borderline sliver: mask loss
+                y_objs.append(y_obj)
+                y_obj_valids.append(y_obj_valid)
+        return (torch.from_numpy(np.stack(targets)).float(),
+                torch.tensor(valids, dtype=torch.float32),
+                torch.tensor(y_objs, dtype=torch.float32),
+                torch.tensor(y_obj_valids, dtype=torch.float32))
 
     def get_hand_prob(self, hands_sequence, H, W):
         """
@@ -154,10 +231,11 @@ class HandAnnoHandler:
 
         return flat
 
-    def horizontal_flip(self, frames, hands_sequence):
+    def horizontal_flip(self, frames, hands_sequence, objects_sequence=None):
         """
         1. Flip the frames horizontally.
         2. Flip the hands_sequence, left to right and right to left
+        3. Flip the objects_sequence boxes (class-agnostic, no side to swap)
         """
         # (L, C, H, W) -> flip on width dimension.
         frames = torch.flip(frames, dims=[3])
@@ -177,7 +255,17 @@ class HandAnnoHandler:
                 new_anno['left hand']['box'] = [W - x2, y1, W - x1, y2]
             flipped_hands.append(new_anno)
 
-        return frames, flipped_hands
+        flipped_objects = None
+        if objects_sequence is not None:
+            flipped_objects = []
+            for objs in objects_sequence:
+                if objs is None:
+                    flipped_objects.append(None)
+                else:
+                    flipped_objects.append(
+                        [[W - x2, y1, W - x1, y2] for x1, y1, x2, y2 in objs])
+
+        return frames, flipped_hands, flipped_objects
 
     def get_hand_aug(self):
         """
@@ -457,7 +545,10 @@ class ActionSpotDataset(Dataset):
                                         # and end of videos
             crop_dim=224,
             hand_dim=224,
-            dataset = 'finediving'     # Dataset name
+            dataset = 'finediving',     # Dataset name
+            obj_head=False,             # Enable object-of-interest branch targets
+            presence_tau=0.1,           # Threshold on rendered target peak for y_obj label
+            obj_anno_dataset=None,      # Object annotation file basename override (shared-video variants)
     ):
         self._src_file = label_file
         self._labels = load_json(label_file)
@@ -504,8 +595,11 @@ class ActionSpotDataset(Dataset):
         assert mixup is False, '[ERROR] For hand-centric crop, mixup is not recommended to use.'
 
         # Frame reader class
-        self._frame_reader = FrameReader(frame_dir, modality, dataset = dataset)
-        self._hand_handler = HandAnnoHandler(scene_size=self._crop_dim, hand_size=self._hand_dim, is_training=True)
+        self._obj_head = obj_head
+        self._frame_reader = FrameReader(frame_dir, modality, dataset = dataset, obj_head = obj_head,
+                                          obj_anno_dataset = obj_anno_dataset)
+        self._hand_handler = HandAnnoHandler(scene_size=self._crop_dim, hand_size=self._hand_dim, is_training=True,
+                                              obj_head=obj_head, presence_tau=presence_tau)
 
         #Store or load clips
         if self._store_mode == 'store':
@@ -600,7 +694,7 @@ class ActionSpotDataset(Dataset):
             dict_labelD = self._labelsD_store[idx]
 
         # Load frames
-        frames, hands = self._frame_reader.load_frames(frames_path, pad=True, stride=self._stride)
+        frames, hands, objects = self._frame_reader.load_frames(frames_path, pad=True, stride=self._stride)
 
         # Process labels
         num_classes = len(self._class_dict) + 1  # bg + all fg classes
@@ -647,6 +741,9 @@ class ActionSpotDataset(Dataset):
 
         if self._radi_displacement > 0:
             clip_data['labelD'] = labelsD
+
+        if self._obj_head:
+            clip_data['objects'] = objects
 
         return clip_data
 
@@ -800,15 +897,31 @@ class ActionSpotDataset(Dataset):
         return self._dataset_len
 
 class FrameReader:
-    def __init__(self, frame_dir, modality, dataset):
+    def __init__(self, frame_dir, modality, dataset, obj_head=False, obj_anno_dataset=None):
         self._frame_dir = frame_dir
         self.modality = modality
         self.dataset = dataset
+        self._obj_head = obj_head
 
         hand_anno_dir = os.path.join(os.path.dirname(frame_dir), 'hand_anno.json')
         with open(hand_anno_dir, 'r') as f:
             self._hand_anno = json.load(f)
             print(f'[INFO] Loaded hand annotation from {hand_anno_dir} with {len(self._hand_anno)} videos.')
+
+        self._obj_anno = None
+        if obj_head:
+            # obj_anno_dataset lets dataset variants that reuse the same underlying videos
+            # (e.g. HOI4D-v3, HOI4D-untouch both reuse plain HOI4D's videos, just with
+            # different event labels) point at one shared annotation file instead of each
+            # needing its own multi-hundred-MB duplicate.
+            anno_name = obj_anno_dataset or dataset
+            obj_anno_path = os.path.join('Object_Annotations', f'{anno_name}_object_bbox.json')
+            if not os.path.exists(obj_anno_path):
+                raise FileNotFoundError(
+                    f'[ERROR] --obj_head enabled but object annotation file not found: {obj_anno_path}')
+            with open(obj_anno_path, 'r') as f:
+                self._obj_anno = json.load(f)
+            print(f'[INFO] Loaded object annotation from {obj_anno_path} with {len(self._obj_anno)} videos.')
 
     def read_frame(self, frame_path):
         img = torchvision.io.read_image(frame_path) #.float() / 255 -> into model normalization / augmentations
@@ -857,6 +970,7 @@ class FrameReader:
 
         ret = []
         hands = []
+        objects = [] if self._obj_head else None
 
         if ndigits == -1:
             for j in range(length - pad_start - pad_end):
@@ -864,6 +978,8 @@ class FrameReader:
 
                 ret.append(self.read_frame(os.path.join(base_path, frame_name)))
                 hands.append(self._hand_anno[video][frame_name])
+                if self._obj_head:
+                    objects.append(self._obj_anno.get(video, {}).get(frame_name))
 
         else:
             path = base_path + '/'
@@ -871,6 +987,8 @@ class FrameReader:
                 frame_name = str(start + j * stride).zfill(ndigits) + '.jpg'
                 ret.append(self.read_frame(path + frame_name))
                 hands.append(self._hand_anno[video][frame_name])
+                if self._obj_head:
+                    objects.append(self._obj_anno.get(video, {}).get(frame_name))
 
         ret = torch.stack(ret, dim=int(len(ret[0].shape) == 4)) # (B, C, H, W)
 
@@ -881,8 +999,10 @@ class FrameReader:
 
             empty_anno = {'left hand': None, 'right hand': None}
             hands = [empty_anno] * pad_start + hands + [empty_anno] * (pad_end if pad else 0)
+            if self._obj_head:
+                objects = [None] * pad_start + objects + [None] * (pad_end if pad else 0)
 
-        return ret, hands
+        return ret, hands, objects
 
 class ActionSpotVideoDataset(Dataset):
 

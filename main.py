@@ -40,12 +40,24 @@ def get_args():
     mode_group.add_argument('--test', action='store_true', help='Testing mode')
 
     parser.add_argument('--aug', action='store_true', help='Use additional horizontal flip pass during inference')
+    parser.add_argument('--stage', type=int, choices=[1, 2], default=None,
+                         help='Object-branch (--obj_head) training stage: 1 = localization-only '
+                              '(heatmap loss only), 2 = full objective, warm-started from the stage 1 '
+                              'checkpoint saved under the same save_dir. Omit for a normal/non-staged run.')
     return parser.parse_args()
 
 def update_args(args, config):
     #Update arguments with config file
     args.frame_dir = config['frame_dir']
     args.save_dir = config['save_dir'] + '/' + args.model # + '-' + str(args.seed) -> in case multiple seeds
+    args.obj_head = config.get('obj_head', False)
+    if args.stage is not None:
+        if not args.obj_head:
+            print('[WARN] --stage was given but obj_head is not enabled in this config; ignoring --stage.')
+        else:
+            # Same experiment, same top-level save_dir -- stage checkpoints just live in
+            # sibling subfolders so stage 2 can auto-discover stage 1's weights.
+            args.save_dir = os.path.join(args.save_dir, f'stage{args.stage}')
     args.store_dir = config['store_dir']
     # args.store_mode = config['store_mode']
     args.store_mode = 'store' if args.store else 'load'
@@ -110,11 +122,35 @@ def update_args(args, config):
     args.windows = config.get('window', [1, 3])
     args.eval_split = config.get('eval_split', EVAL_SPLITS)
 
+    # args.obj_head already set above (needed early to compute args.save_dir)
+    args.obj_loss_weight = config.get('obj_loss_weight', 0.15)
+    args.obj_fg_weight = config.get('obj_fg_weight', 10.0)
+    args.obj_stage1 = bool(args.obj_head and args.stage == 1)
+    args.lambda_presence = config.get('lambda_presence', 0.75)
+    args.presence_tau = config.get('presence_tau', 0.1)
+    args.obj_anno_dataset = config.get('obj_anno_dataset', None)
+
     print('\n\n===== ABLATION SETTINGS ========================================================')
     if args.grasp_loss:
         print('[INFO] Using grasp loss')
     else:
         print('[WARN] NOT using grasp loss')
+
+    if args.obj_head:
+        if args.stage == 1:
+            stage_str = 'Stage 1 (localization-only)'
+        elif args.stage == 2:
+            stage_str = 'Stage 2 (full objective, warm-started from stage 1 if available)'
+        else:
+            stage_str = 'end-to-end (full objective, no staging)'
+        print(f'[INFO] Using object-of-interest heatmap branch ({stage_str}, '
+              f'loss_weight={args.obj_loss_weight}, fg_weight={args.obj_fg_weight}, '
+              f'lambda_presence={args.lambda_presence}, presence_tau={args.presence_tau})')
+        if args.obj_anno_dataset:
+            print(f'[INFO] Object annotations shared from dataset: {args.obj_anno_dataset}')
+        print(f'[INFO] obj-head save_dir: {args.save_dir}')
+    else:
+        print('[WARN] NOT using object-of-interest heatmap branch')
 
     if args.soft_labels:
         print('[INFO] Using soft labels')
@@ -265,6 +301,22 @@ def main(args):
         model._model.update_pred_head(n_classes)
         model._num_classes = np.array(n_classes).sum()
 
+    # Two-stage obj_head schedule: Stage 2 auto-discovers its Stage 1 checkpoint as a
+    # sibling folder under the same experiment save_dir (.../<model>/stage1/checkpoint_best.pt
+    # next to .../<model>/stage2/). Skipped when resuming an interrupted run of this same
+    # stage (resume takes priority), or when no Stage 1 checkpoint exists yet (falls back
+    # to training Stage 2 end-to-end from scratch).
+    if args.obj_head and args.stage == 2 and not args.resume:
+        stage1_ckpt = os.path.join(os.path.dirname(args.save_dir), 'stage1', 'checkpoint_best.pt')
+        if os.path.exists(stage1_ckpt):
+            init_checkpoint = torch.load(stage1_ckpt, map_location=args.device)
+            init_state_dict = init_checkpoint['model_state_dict'] if 'model_state_dict' in init_checkpoint else init_checkpoint
+            model.load(init_state_dict)
+            print(f'[INFO] Initialized weights from Stage 1 checkpoint: {stage1_ckpt}')
+        else:
+            print(f'[WARN] No Stage 1 checkpoint found at {stage1_ckpt} -- '
+                  f'training Stage 2 end-to-end from scratch.')
+
     sam_args = {'rho': args.sam_rho, 'adaptive': args.sam_adaptive} if args.sam else None
     optimizer, scaler = model.get_optimizer(opt_args = {'lr': args.learning_rate}, sam_args=sam_args)
 
@@ -286,7 +338,10 @@ def main(args):
             args, optimizer, num_steps_per_epoch, sam=args.sam)
 
         losses = []
-        best_criterion = 0 if args.criterion == 'map' else float('inf')
+        # Stage 1 selects its "best" checkpoint by validation localization loss (lower is
+        # better), not touch/untouch mAP -- the temporal head is untrained this stage, so
+        # mAP would be meaningless and evaluate() would be wasted compute every epoch.
+        best_criterion = float('inf') if (args.obj_stage1 or args.criterion != 'map') else 0
         epoch = 0
 
         if args.resume:
@@ -322,7 +377,14 @@ def main(args):
 
             better = False
             val_mAP = 0
-            if args.criterion == 'loss':
+            if args.obj_stage1:
+                # Matches the actual Stage 1 training objective (heatmap + presence), not
+                # just the heatmap term, so "best" reflects what's actually being optimized.
+                val_stage1_obj = val_loss_dict['obj_loss'] + args.lambda_presence * val_loss_dict['presence_loss']
+                if val_stage1_obj < best_criterion:
+                    best_criterion = val_stage1_obj
+                    better = True
+            elif args.criterion == 'loss':
                 if val_loss < best_criterion:
                     best_criterion = val_loss
                     better = True
@@ -337,7 +399,20 @@ def main(args):
             #Printing info epoch
             print('[Epoch {}] Train loss: {:0.5f} Val loss: {:0.5f} LR: {:0.8f}'.format(
                 epoch, train_loss, val_loss, current_lr))
-            if (args.criterion == 'map') & (epoch >= args.start_val_epoch):
+            if args.obj_head:
+                # gamma stays 0 through Stage 1 by design (main_loss isn't part of that
+                # objective, so it never gets a gradient) -- only meaningful to watch once
+                # Stage 2/end-to-end is running. See advisor note: if this stays pinned near
+                # 0 there, the object branch isn't actually being used by the main task.
+                print('  gamma: {:0.6f}'.format(model._model._gamma.item()))
+            if args.obj_stage1:
+                print('Val obj_loss (heatmap): {:0.5f}  presence_loss: {:0.5f}  '
+                      'presence_acc pos/neg: {:0.3f}/{:0.3f}'.format(
+                          val_loss_dict['obj_loss'], val_loss_dict['presence_loss'],
+                          val_loss_dict['presence_acc_pos'], val_loss_dict['presence_acc_neg']))
+                if better:
+                    print('New best obj_loss epoch!')
+            elif (args.criterion == 'map') & (epoch >= args.start_val_epoch):
                 print('Val mAP: {:0.5f}'.format(val_mAP))
                 if better:
                     print('New best mAP epoch!')
@@ -372,15 +447,40 @@ def main(args):
                 wandb.log({'losses/train_loss': train_loss, 'losses/val_loss': val_loss, 'losses/val_mAP': val_mAP})
                 wandb.log({'train/main_loss': train_loss_dict['main_loss'],
                            'train/displ_loss': train_loss_dict['displ_loss'],
-                           'train/grasp_loss': train_loss_dict['grasp_loss']})
+                           'train/grasp_loss': train_loss_dict['grasp_loss'],
+                           'train/obj_loss': train_loss_dict['obj_loss'],
+                           'train/presence_loss': train_loss_dict['presence_loss'],
+                           'train/presence_acc_pos': train_loss_dict['presence_acc_pos'],
+                           'train/presence_acc_neg': train_loss_dict['presence_acc_neg']})
                 wandb.log({'val/main_loss': val_loss_dict['main_loss'],
                            'val/displ_loss': val_loss_dict['displ_loss'],
-                           'val/grasp_loss': val_loss_dict['grasp_loss']})
+                           'val/grasp_loss': val_loss_dict['grasp_loss'],
+                           'val/obj_loss': val_loss_dict['obj_loss'],
+                           'val/presence_loss': val_loss_dict['presence_loss'],
+                           'val/presence_acc_pos': val_loss_dict['presence_acc_pos'],
+                           'val/presence_acc_neg': val_loss_dict['presence_acc_neg']})
+
+                if args.obj_head:
+                    # Watch this: the event loss only reshapes the heatmap/object feature
+                    # through gamma*proj(...) (see advisor review) -- if gamma stays pinned
+                    # near 0, fusion never actually engages and training is silently running
+                    # the deep-supervision-only ablation instead of the full method.
+                    wandb.log({'obj/gamma': model._model._gamma.item()})
 
             else:
                 wandb.log({'losses/train_loss': train_loss, 'losses/val_loss': val_loss})
             wandb.log({'losses/lr': current_lr})
 
+    if args.obj_stage1:
+        # Stage 1 (localization-only) checkpoints have an untrained temporal stack / pred
+        # heads, so touch/untouch mAP here would be meaningless -- skip straight to Stage 2
+        # instead (rerun with --stage 2, same --model/config).
+        print('-' * 80)
+        print('[INFO] Stage 1 (localization-only) training complete. '
+              f'Checkpoint saved under {args.save_dir}. Skipping final touch/untouch evaluation -- '
+              'run the same config with --stage 2 next.')
+        wandb.finish()
+        return
 
     ##### TESTING / INFERENCE ################################################################
     print('-' * 80)

@@ -80,6 +80,7 @@ def build_args(config, device):
     args.radi_displacement = config['radi_displacement']
     args.amp               = config.get('amp', True)
     args.grasp_loss        = config.get('grasp_loss', False)
+    args.obj_head          = config.get('obj_head', False)
     args.use_kpe           = config.get('use_kpe', False)
     args.use_glb_feat      = config.get('use_glb_feat', False)
     args.share_enc         = config.get('share_enc', False)

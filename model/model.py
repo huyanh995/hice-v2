@@ -163,6 +163,38 @@ class TDEEDModel(BaseRGBModel):
                 self._pred_displ = FCLayers(radi_input_dim, 1)
                 print(f'[INFO] Using displacement with {self._radi_displacement} radius.')
 
+            self._obj_head = getattr(args, 'obj_head', False)
+
+            if self._obj_head:
+                # Object-of-interest heatmap head: reads the post-FFN, hand-conditioned
+                # 7x7 map (same map cls_head pools). Kept diffentiable end-to-end so the
+                # touch/untouch loss can reshape localization (see reference PDF sec 2.1).
+                self._obj_heatmap_head = nn.Sequential(
+                    nn.Conv2d(feat_dim, feat_dim // 4, kernel_size=3, padding=1),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(feat_dim // 4, 1, kernel_size=1),
+                )
+                # Presence/trust gate: supervised separately from the heatmap (change note
+                # sec 1) -- the heatmap answers *where* to pool, this answers *whether* the
+                # pooled feature is usable at all. Reads f_global only (already hand-conditioned
+                # via cross-attention).
+                self._presence_mlp = nn.Sequential(
+                    nn.Linear(feat_dim, feat_dim // 4),
+                    nn.ReLU(inplace=True),
+                    nn.Linear(feat_dim // 4, 1),
+                )
+                # bias=False so a fully-closed presence gate (q_obj->0, hence f_obj->0) reverts
+                # exactly to im_feat==f_global for that frame -- with a bias, obj_proj(0)==bias
+                # would leak a learned constant through even when the gate says "nothing here",
+                # which is the mid-training equivalent of the step-0 safety property below.
+                self._obj_proj = nn.Linear(feat_dim, feat_dim, bias=False)
+                # Zero-initialized residual gate: at step 0, fused im_feat == f_global exactly
+                # regardless of _obj_proj's random init (bit-exact baseline reproduction --
+                # a safety property kept in every configuration, not just an ablation default;
+                # see change note sec 1/6).
+                self._gamma = nn.Parameter(torch.zeros(1))
+                print('[INFO] Using object-of-interest heatmap branch (--obj_head).')
+
             self._grasp_loss = args.grasp_loss
 
             if self._grasp_loss:
@@ -298,7 +330,27 @@ class TDEEDModel(BaseRGBModel):
             im_feat = im_feat_flat.permute(1, 2, 0).view(B*L, C_feat, H_feat, W_feat)  # Back to (B*L, C, H, W)
 
             # Global pooling: (B*L, 768)
-            im_feat = self.cls_head(im_feat).reshape(B, L, self._d) # (B*L, 768) -> (B, L, 768)
+            if self._obj_head:
+                obj_logits = self._obj_heatmap_head(im_feat)  # (B*L, 1, 7, 7)
+                obj_logits_flat = obj_logits.flatten(2)  # (B*L, 1, 49)
+                attn = torch.softmax(obj_logits_flat, dim=-1)  # (B*L, 1, 49) -- spatial attn only, no trust role
+                f_obj = torch.bmm(im_feat.flatten(2), attn.transpose(1, 2)).squeeze(-1)  # (B*L, C)
+
+                f_global = self.cls_head(im_feat).reshape(B * L, self._d)  # (B*L, 768)
+
+                # Supervised presence/trust gate (change note sec 2): whether a usable object
+                # exists at all, predicted from f_global -- decoupled from where the heatmap
+                # happens to peak. Keep raw logits around for the loss (BCEWithLogits is the
+                # numerically stable choice under AMP; plain BCE on an already-sigmoid'd value
+                # can hit log(0) in fp16), sigmoid only for the gate itself and for metrics.
+                presence_logits = self._presence_mlp(f_global)  # (B*L, 1)
+                q_obj = torch.sigmoid(presence_logits)
+                f_obj = q_obj * f_obj
+
+                obj_delta = self._obj_proj(f_obj)  # (B*L, 768) -- residual, f_obj alone (no concat)
+                im_feat = (f_global + self._gamma * obj_delta).reshape(B, L, self._d)
+            else:
+                im_feat = self.cls_head(im_feat).reshape(B, L, self._d) # (B*L, 768) -> (B, L, 768)
 
             if inference:
                 feat_save['attn'] = im_feat.detach().clone().cpu()
@@ -357,6 +409,11 @@ class TDEEDModel(BaseRGBModel):
                 res['left_valid'] = left_flag
                 res['right_pred'] = right_preds.reshape(B*L, -1)
                 res['right_valid'] = right_flag
+
+            if self._obj_head:
+                res['obj_heatmap'] = obj_logits.reshape(B, L, 7, 7)
+                res['obj_presence'] = q_obj.reshape(B, L)
+                res['obj_presence_logits'] = presence_logits.reshape(B, L)
 
             if inference:
                 return res, feat_save
@@ -740,7 +797,10 @@ class TDEEDModel(BaseRGBModel):
                 [1] + [fg_weight] * (self._num_classes - 1)).to(self.device)
 
         epoch_loss = 0.
-        loss_dict = {'main_loss': 0., 'displ_loss': 0., 'grasp_loss': 0.}
+        loss_dict = {'main_loss': 0., 'displ_loss': 0., 'grasp_loss': 0., 'obj_loss': 0.,
+                     'presence_loss': 0.,
+                     'presence_pos_correct': 0., 'presence_pos_total': 0.,
+                     'presence_neg_correct': 0., 'presence_neg_total': 0.}
         with torch.no_grad() if optimizer is None else nullcontext():
             for batch_idx, batch in enumerate(tqdm(loader)):
                 frame = batch['frame'].to(self.device).float()
@@ -752,6 +812,12 @@ class TDEEDModel(BaseRGBModel):
 
                 left_grasp = batch['left_grasp'].to(self.device).float()
                 right_grasp = batch['right_grasp'].to(self.device).float()
+
+                if self._args.obj_head:
+                    obj_target = batch['obj_target'].to(self.device).float()  # (B, L, 7, 7)
+                    obj_valid = batch['obj_valid'].to(self.device).float()    # (B, L)
+                    y_obj = batch['y_obj'].to(self.device).float()            # (B, L)
+                    y_obj_valid = batch['y_obj_valid'].to(self.device).float()  # (B, L)
 
                 ### Preparing for input, in case of using mixup or double heads ##########################################
 
@@ -873,6 +939,51 @@ class TDEEDModel(BaseRGBModel):
                         loss += lossD
                         loss_dict['displ_loss'] += lossD.detach().item()
 
+                    if self._args.obj_head:
+                        obj_logits = preds['obj_heatmap']  # (B, L, 7, 7)
+                        obj_loss_raw = F.binary_cross_entropy_with_logits(
+                            obj_logits, obj_target, reduction='none')  # (B, L, 7, 7)
+                        # Foreground weighting: only ~5-15% of cells are positive
+                        # (reference PDF sec 4.3), without this the head learns all-zeros.
+                        fg_weight = self._args.obj_fg_weight
+                        obj_loss_raw = obj_loss_raw * (1.0 + (fg_weight - 1.0) * obj_target)
+                        obj_loss_raw = obj_loss_raw.mean(dim=(2, 3))  # (B, L) per-cell mean BCE per frame
+                        denom = obj_valid.sum().clamp_min(1.0)
+                        heatmap_loss = (obj_loss_raw * obj_valid).sum() / denom
+                        loss_dict['obj_loss'] += heatmap_loss.detach().item()
+
+                        # Presence/trust gate supervision (change note sec 3): masked scalar
+                        # BCE against y_obj, derived from the same rendered grid via a
+                        # thresholded ignore band -- borderline crops (y_obj_valid=0) drop out.
+                        q_obj = preds['obj_presence']  # (B, L), sigmoid'd -- for gating/metrics only
+                        presence_logits = preds['obj_presence_logits']  # (B, L) -- for the loss (AMP-stable)
+                        presence_loss_raw = F.binary_cross_entropy_with_logits(
+                            presence_logits, y_obj, reduction='none')  # (B, L)
+                        presence_denom = y_obj_valid.sum().clamp_min(1.0)
+                        presence_loss = (presence_loss_raw * y_obj_valid).sum() / presence_denom
+                        loss_dict['presence_loss'] += presence_loss.detach().item()
+
+                        obj_loss = heatmap_loss + self._args.lambda_presence * presence_loss
+
+                        with torch.no_grad():
+                            valid_mask = y_obj_valid > 0
+                            pos_mask = valid_mask & (y_obj > 0.5)
+                            neg_mask = valid_mask & (y_obj <= 0.5)
+                            pred_bin = (q_obj > 0.5).float()
+                            loss_dict['presence_pos_correct'] += (pred_bin[pos_mask] == y_obj[pos_mask]).sum().item()
+                            loss_dict['presence_pos_total'] += pos_mask.sum().item()
+                            loss_dict['presence_neg_correct'] += (pred_bin[neg_mask] == y_obj[neg_mask]).sum().item()
+                            loss_dict['presence_neg_total'] += neg_mask.sum().item()
+
+                        if self._args.obj_stage1:
+                            # Stage 1: localization-only -- heatmap + presence loss is the
+                            # entire objective (raw, unweighted -- obj_loss_weight only matters
+                            # once it's balanced against other terms in stage 2), so gradient
+                            # never reaches the temporal stack / pred heads.
+                            loss = obj_loss
+                        else:
+                            loss += self._args.obj_loss_weight * obj_loss
+
                 if optimizer is not None:
                     step(optimizer, scaler, loss / acc_grad_iter,
                         lr_scheduler=lr_scheduler,
@@ -886,7 +997,15 @@ class TDEEDModel(BaseRGBModel):
         if valMAP:
             return epoch_loss / len(loader), torch.cat(map_labels, 0), torch.cat(map_preds, 0)
 
-        return epoch_loss / len(loader), {k: v / len(loader) for k, v in loss_dict.items()}     # Avg loss
+        # presence_*_correct/total are raw counts accumulated across the whole epoch (not
+        # per-batch means), since batches can have zero pos/neg frames -- divide into exact
+        # epoch-level accuracies here instead of the generic /len(loader) averaging below.
+        count_keys = ('presence_pos_correct', 'presence_pos_total', 'presence_neg_correct', 'presence_neg_total')
+        avg_loss_dict = {k: v / len(loader) for k, v in loss_dict.items() if k not in count_keys}
+        avg_loss_dict['presence_acc_pos'] = loss_dict['presence_pos_correct'] / max(1., loss_dict['presence_pos_total'])
+        avg_loss_dict['presence_acc_neg'] = loss_dict['presence_neg_correct'] / max(1., loss_dict['presence_neg_total'])
+
+        return epoch_loss / len(loader), avg_loss_dict     # Avg loss
 
     def grasp_loss(self, pred_grasp, gt_grasp, is_valid, return_mean=True):
         loss_grasp = F.cross_entropy(pred_grasp, gt_grasp, reduction='none')
