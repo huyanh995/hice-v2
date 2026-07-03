@@ -807,6 +807,13 @@ class TDEEDModel(BaseRGBModel):
                      'presence_loss': 0.,
                      'presence_pos_correct': 0., 'presence_pos_total': 0.,
                      'presence_neg_correct': 0., 'presence_neg_total': 0.}
+        # Mean |gradient| on the fusion gate _gamma across this epoch's optimizer steps --
+        # distinguishes "fusion honestly reporting f_obj is useless" (gamma stays 0 with a
+        # ~0 gradient too) from "fusion wants to move but can't" (gamma stays 0 despite a
+        # real gradient signal). Only populated during training (optimizer is not None).
+        gamma_grad_abs_sum = 0.
+        gamma_grad_steps = 0
+        track_gamma = self._args.obj_head and optimizer is not None
         with torch.no_grad() if optimizer is None else nullcontext():
             for batch_idx, batch in enumerate(tqdm(loader)):
                 frame = batch['frame'].to(self.device).float()
@@ -1029,10 +1036,14 @@ class TDEEDModel(BaseRGBModel):
                     loss_dict[k] += v
 
                 if optimizer is not None:
-                    step(optimizer, scaler, loss / acc_grad_iter,
+                    gamma_grad = step(optimizer, scaler, loss / acc_grad_iter,
                         lr_scheduler=lr_scheduler,
                         backward_only=(batch_idx + 1) % acc_grad_iter != 0,
-                        max_norm=max_norm)
+                        max_norm=max_norm,
+                        track_param=self._model._gamma if track_gamma else None)
+                    if gamma_grad is not None:
+                        gamma_grad_abs_sum += gamma_grad.abs().item()
+                        gamma_grad_steps += 1
 
                 epoch_loss += loss.detach().item()
                 valid_batches += 1
@@ -1053,6 +1064,7 @@ class TDEEDModel(BaseRGBModel):
         avg_loss_dict = {k: v / denom for k, v in loss_dict.items() if k not in count_keys}
         avg_loss_dict['presence_acc_pos'] = loss_dict['presence_pos_correct'] / max(1., loss_dict['presence_pos_total'])
         avg_loss_dict['presence_acc_neg'] = loss_dict['presence_neg_correct'] / max(1., loss_dict['presence_neg_total'])
+        avg_loss_dict['gamma_grad'] = gamma_grad_abs_sum / max(1, gamma_grad_steps)
 
         return epoch_loss / denom, avg_loss_dict     # Avg loss
 

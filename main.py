@@ -412,7 +412,11 @@ def main(args):
                 # objective, so it never gets a gradient) -- only meaningful to watch once
                 # Stage 2/end-to-end is running. See advisor note: if this stays pinned near
                 # 0 there, the object branch isn't actually being used by the main task.
-                print('  gamma: {:0.6f}'.format(model._model._gamma.item()))
+                # grad is mean |gamma.grad| across this epoch's training steps -- distinguishes
+                # "fusion honestly unused" (grad ~0 too) from "fusion wants to move but can't"
+                # (grad is real but gamma stays pinned near 0 anyway).
+                print('  gamma: {:0.6f}  grad: {:0.3e}'.format(
+                    model._model._gamma.item(), train_loss_dict['gamma_grad']))
             if args.obj_stage1:
                 print('Val obj_loss (heatmap): {:0.5f}  presence_loss: {:0.5f}  '
                       'presence_acc pos/neg: {:0.3f}/{:0.3f}'.format(
@@ -484,7 +488,11 @@ def main(args):
                     # through gamma*proj(...) (see advisor review) -- if gamma stays pinned
                     # near 0, fusion never actually engages and training is silently running
                     # the deep-supervision-only ablation instead of the full method.
-                    wandb.log({'obj/gamma': model._model._gamma.item()})
+                    # obj/gamma_grad is mean |gamma.grad| over this epoch's training steps --
+                    # a real gradient with gamma still pinned near 0 means something (e.g.
+                    # weight decay) is fighting the signal, not that the signal is absent.
+                    wandb.log({'obj/gamma': model._model._gamma.item(),
+                               'obj/gamma_grad': train_loss_dict['gamma_grad']})
 
             else:
                 wandb.log({'losses/train_loss': train_loss, 'losses/val_loss': val_loss})

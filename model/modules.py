@@ -432,11 +432,17 @@ class FC2Layers(nn.Module):
 #             lr_scheduler.step()
 #         optimizer.zero_grad()
 
-def step(optimizer, scaler, loss, lr_scheduler=None, backward_only=False, max_norm=None):
+def step(optimizer, scaler, loss, lr_scheduler=None, backward_only=False, max_norm=None, track_param=None):
     # Remove the if else condition as scaler with enabled=False works the same way.
     scaler.scale(loss).backward()
 
+    tracked_grad = None
     if not backward_only:
+        # Snapshot before clipping/zero_grad -- this is the actual accumulated gradient
+        # (summed across acc_grad_iter micro-batches) about to drive this update.
+        if track_param is not None and track_param.grad is not None:
+            tracked_grad = track_param.grad.detach().clone()
+
         # Gradient clipping
         if max_norm is not None:
             if scaler.is_enabled():
@@ -454,6 +460,8 @@ def step(optimizer, scaler, loss, lr_scheduler=None, backward_only=False, max_no
             lr_scheduler.step()
 
         optimizer.zero_grad()
+
+    return tracked_grad
 
 ### Original process_prediction function ###
 def process_prediction_orig(pred, predD):
