@@ -137,14 +137,8 @@ def update_args(args, config):
         print('[WARN] NOT using grasp loss')
 
     if args.obj_head:
-        if args.stage == 1:
-            stage_str = 'Stage 1 (localization-only)'
-        elif args.stage == 2:
-            stage_str = 'Stage 2 (full objective, warm-started from stage 1 if available)'
-        else:
-            stage_str = 'end-to-end (full objective, no staging)'
-        print(f'[INFO] Using object-of-interest heatmap branch ({stage_str}, '
-              f'loss_weight={args.obj_loss_weight}, fg_weight={args.obj_fg_weight}, '
+        print(f'[INFO] Using object-of-interest heatmap branch '
+              f'(loss_weight={args.obj_loss_weight}, fg_weight={args.obj_fg_weight}, '
               f'lambda_presence={args.lambda_presence}, presence_tau={args.presence_tau})')
         if args.obj_anno_dataset:
             print(f'[INFO] Object annotations shared from dataset: {args.obj_anno_dataset}')
@@ -168,6 +162,14 @@ def update_args(args, config):
         print('[WARN] NOT using temporal shift modules in the model.')
 
     print('=' * 80 + '\n\n')
+
+    if args.obj_head and args.stage in (1, 2):
+        print('===== STAGE SETTINGS ===========================================================')
+        if args.stage == 1:
+            print('[STAGE] Stage 1 Training (localization-only)')
+        else:
+            print('[STAGE] Stage 2 Training (full objective)')
+        print('=' * 80 + '\n\n')
 
     if not args.amp:
         print('[WARNING] AMP is disabled, training might be slower.')
@@ -312,10 +314,10 @@ def main(args):
             init_checkpoint = torch.load(stage1_ckpt, map_location=args.device)
             init_state_dict = init_checkpoint['model_state_dict'] if 'model_state_dict' in init_checkpoint else init_checkpoint
             model.load(init_state_dict)
-            print(f'[INFO] Initialized weights from Stage 1 checkpoint: {stage1_ckpt}')
+            print(f'[STAGE] Stage 2 Training -- used Stage 1 weight from {stage1_ckpt}')
         else:
-            print(f'[WARN] No Stage 1 checkpoint found at {stage1_ckpt} -- '
-                  f'training Stage 2 end-to-end from scratch.')
+            print(f'[STAGE] Stage 2 Training -- no Stage 1 checkpoint found at {stage1_ckpt}, '
+                  f'training end-to-end from scratch.')
 
     sam_args = {'rho': args.sam_rho, 'adaptive': args.sam_adaptive} if args.sam else None
     optimizer, scaler = model.get_optimizer(opt_args = {'lr': args.learning_rate}, sam_args=sam_args)
