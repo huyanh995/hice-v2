@@ -337,6 +337,7 @@ class TDEEDModel(BaseRGBModel):
                 prob = torch.sigmoid(obj_logits.float())
                 weights = prob.flatten(2)
                 attn = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
+                attn = attn.to(im_feat.dtype)
 
                 f_obj = torch.bmm(im_feat.flatten(2), attn.transpose(1, 2)).squeeze(-1)  # (B*L, C)
 
@@ -871,9 +872,11 @@ class TDEEDModel(BaseRGBModel):
                         labelD = labelD_dist
 
                 if valMAP:
+                    # Appended after the non-finite guard below, once we know this batch is
+                    # actually kept -- map_labels/map_preds must stay paired, and a skipped
+                    # batch's NaN predictions can't be allowed to leak into mAP scoring.
                     labels_aux = process_labels(label, labelD if 'labelD' in batch.keys() else None,
                                         num_classes = self._num_classes)
-                    map_labels.append(labels_aux.cpu())
 
                 # Depends on whether mixup is used
                 label = label.flatten() if len(label.shape) == 2 \
@@ -899,7 +902,6 @@ class TDEEDModel(BaseRGBModel):
 
                     if valMAP:
                         pred_aux = self.process_prediction(pred, predD)
-                        map_preds.append(pred_aux.cpu())
 
                     loss = 0.
                     # Buffered here, merged into loss_dict only once `loss` is confirmed
@@ -1019,6 +1021,10 @@ class TDEEDModel(BaseRGBModel):
                     print(f"[WARN] non-finite VAL loss at batch {batch_idx}, epoch {epoch} -- skipping batch")
                     continue
 
+                if valMAP:
+                    map_labels.append(labels_aux.cpu())
+                    map_preds.append(pred_aux.cpu())
+
                 for k, v in batch_stats.items():
                     loss_dict[k] += v
 
@@ -1034,7 +1040,7 @@ class TDEEDModel(BaseRGBModel):
                 # break # DEBUG
 
         if valMAP:
-            return epoch_loss / len(loader), torch.cat(map_labels, 0), torch.cat(map_preds, 0)
+            return epoch_loss / max(1, valid_batches), torch.cat(map_labels, 0), torch.cat(map_preds, 0)
 
         # presence_*_correct/total are raw counts accumulated across the whole epoch (not
         # per-batch means), since batches can have zero pos/neg frames -- divide into exact

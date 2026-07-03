@@ -117,7 +117,7 @@ def update_args(args, config):
     args.soft_labels = config.get('soft_labels', False)
     args.amp = config.get('amp', True)
     args.bi_interp_post = config.get('bi_interp_post', True)
-    args.temporal_shift = config.get('temporal_shift: true', True)
+    args.temporal_shift = config.get('temporal_shift', True)
     args.tolerances = config.get('tolerance', [0, 1, 2])
     args.windows = config.get('window', [1, 3])
     args.eval_split = config.get('eval_split', EVAL_SPLITS)
