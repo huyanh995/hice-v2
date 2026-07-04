@@ -36,6 +36,7 @@ def get_datasets(args):
 
     dataset_kwargs = {
         'stride': stride, 'overlap': overlap, 'radi_displacement': args.radi_displacement,
+        'radi_displacement_sup': args.radi_displacement_sup,
         'mixup': args.mixup, 'dataset': args.dataset, 'obj_head': args.obj_head,
         'presence_tau': args.presence_tau, 'obj_anno_dataset': args.obj_anno_dataset,
     }
@@ -115,6 +116,7 @@ def get_datasets(args):
 
         dataset_pretrain_kwargs = {
             'stride': stride_pretrain, 'overlap': overlap_pretrain, 'radi_displacement': args.radi_displacement,
+            'radi_displacement_sup': args.radi_displacement_sup,
             'mixup': args.mixup, 'dataset': args.pretrain['dataset']
         }
 

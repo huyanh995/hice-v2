@@ -66,6 +66,12 @@ def update_args(args, config):
     args.crop_dim = config['crop_dim']
     args.dataset = config['dataset']
     args.radi_displacement = config['radi_displacement']
+    # Displacement supervision radius: wider than the score-label radius above, since
+    # displacement truth is unambiguous at any distance while the score gaussian must
+    # stay narrow (see dataset/frame.py). Defaults to 2x if not set in config.
+    args.radi_displacement_sup = config.get('radi_displacement_sup', 2 * args.radi_displacement)
+    assert args.radi_displacement_sup >= args.radi_displacement, \
+        'radi_displacement_sup must be >= radi_displacement'
     args.epoch_num_frames = config['epoch_num_frames']
     args.feature_arch = config['feature_arch']
     args.learning_rate = config['learning_rate']

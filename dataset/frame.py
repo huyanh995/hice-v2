@@ -538,7 +538,8 @@ class ActionSpotDataset(Dataset):
             dataset_len,                # Number of clips
             stride=1,                   # Downsample frame rate
             overlap=1,                  # Overlap between clips (in proportion to clip_len)
-            radi_displacement=0,        # Radius of displacement for labels
+            radi_displacement=0,        # Radius of the score-label gaussian (unchanged semantics)
+            radi_displacement_sup=None, # Wider radius for labelD supervision; defaults to 2x above
             soft_labels=False,          # Use soft labels (gaussian window) or not
             mixup=False,                # Mixup usage
             pad_len=DEFAULT_PAD_LEN,    # Number of frames to pad the start
@@ -584,6 +585,13 @@ class ActionSpotDataset(Dataset):
 
         # Label modifications
         self._radi_displacement = radi_displacement
+        # Displacement supervision radius: wider than the score-label radius, since
+        # displacement truth is unambiguous at any distance while the score gaussian
+        # must stay narrow (see _get_one()).
+        self._radi_displacement_sup = (
+            2 * radi_displacement if radi_displacement_sup is None else radi_displacement_sup)
+        assert self._radi_displacement_sup >= self._radi_displacement, \
+            'radi_displacement_sup must be >= radi_displacement'
         self._soft_labels = soft_labels
         print('[INFO] Using soft labels: ' + str(soft_labels))
 
@@ -612,9 +620,12 @@ class ActionSpotDataset(Dataset):
     def _store_clips(self):
         #Initialize frame paths list
         self._frame_paths = []
-        self._labels_store = []
-        if self._radi_displacement > 0:
-            self._labelsD_store = []
+        # Single unified list of {'label_idx', 'label', 'displ'} entries per clip,
+        # dilated out to the WIDE supervision radius (radi_displacement_sup). The
+        # narrow score-label radius (radi_displacement) is applied when this is
+        # consumed in _get_one(), not here -- displacement truth is unambiguous at
+        # any distance, so one wide pass covers both label types.
+        self._entries_store = []
         for video in tqdm(self._labels):
             video_len = int(video['num_frames'])
 
@@ -624,58 +635,50 @@ class ActionSpotDataset(Dataset):
 
                 frames_paths = self._frame_reader.load_paths(video['video'], base_idx, base_idx + self._clip_len * self._stride, stride=self._stride)
 
-                labels = []
-                if self._radi_displacement >= 0:
-                    labelsD = []
+                entries = []
                 for event in labels_file:
                     event_frame = event['frame']
                     label_idx = (event_frame - base_idx) // self._stride
 
                     if self._radi_displacement >= 0:
-                        if (label_idx >= -self._radi_displacement and label_idx < self._clip_len + self._radi_displacement):
+                        radi_sup = self._radi_displacement_sup
+                        if (label_idx >= -radi_sup and label_idx < self._clip_len + radi_sup):
                             label = self._class_dict[event['label']]
-                            for i in range(max(0, label_idx - self._radi_displacement), min(self._clip_len, label_idx + self._radi_displacement + 1)):
-                                labels.append({'label': label, 'label_idx': i})
-                                labelsD.append({'displ': i - label_idx, 'label_idx': i})
+                            for i in range(max(0, label_idx - radi_sup), min(self._clip_len, label_idx + radi_sup + 1)):
+                                entries.append({'label_idx': i, 'label': label, 'displ': i - label_idx})
 
                     else: #EXCLUDE OR MODIFY FOR RADI OF 0
                         if (label_idx >= -self._dilate_len and label_idx < self._clip_len + self._dilate_len):
                             label = self._class_dict[event['label']]
                             for i in range(max(0, label_idx - self._dilate_len), min(self._clip_len, label_idx + self._dilate_len + 1)):
-                                labels.append({'label': label, 'label_idx': i})
+                                entries.append({'label': label, 'label_idx': i})
 
                 if frames_paths[1] != -1: #in case no frames were available
                     self._frame_paths.append(frames_paths)
-                    self._labels_store.append(labels)
-                    if self._radi_displacement > 0:
-                        self._labelsD_store.append(labelsD)
+                    self._entries_store.append(entries)
 
         #Save to store
-        store_path = os.path.join(self._store_dir, 'LEN' + str(self._clip_len) + 'DIS' + str(self._radi_displacement) + 'SPLIT' + self._split)
+        store_path = os.path.join(self._store_dir, 'LEN' + str(self._clip_len) + 'DIS' + str(self._radi_displacement) +
+                                   'SUP' + str(self._radi_displacement_sup) + 'SPLIT' + self._split)
 
         if not os.path.exists(store_path):
             os.makedirs(store_path)
 
         with open(store_path + '/frame_paths.pkl', 'wb') as f:
             pickle.dump(self._frame_paths, f)
-        with open(store_path + '/labels.pkl', 'wb') as f:
-            pickle.dump(self._labels_store, f)
-        if self._radi_displacement > 0:
-            with open(store_path + '/labelsD.pkl', 'wb') as f:
-                pickle.dump(self._labelsD_store, f)
+        with open(store_path + '/entries.pkl', 'wb') as f:
+            pickle.dump(self._entries_store, f)
         print('[INFO] Stored clips to ' + store_path)
         return
 
     def _load_clips(self):
-        store_path = os.path.join(self._store_dir, 'LEN' + str(self._clip_len) + 'DIS' + str(self._radi_displacement) + 'SPLIT' + self._split)
+        store_path = os.path.join(self._store_dir, 'LEN' + str(self._clip_len) + 'DIS' + str(self._radi_displacement) +
+                                   'SUP' + str(self._radi_displacement_sup) + 'SPLIT' + self._split)
 
         with open(store_path + '/frame_paths.pkl', 'rb') as f:
             self._frame_paths = pickle.load(f)
-        with open(store_path + '/labels.pkl', 'rb') as f:
-            self._labels_store = pickle.load(f)
-        if self._radi_displacement > 0:
-            with open(store_path + '/labelsD.pkl', 'rb') as f:
-                self._labelsD_store = pickle.load(f)
+        with open(store_path + '/entries.pkl', 'rb') as f:
+            self._entries_store = pickle.load(f)
         print('[INFO] Loaded clips from ' + store_path)
         return
 
@@ -689,9 +692,10 @@ class ActionSpotDataset(Dataset):
 
         # Get frame_path and labels dict
         frames_path = self._frame_paths[idx]
-        dict_label = self._labels_store[idx]
-        if self._radi_displacement > 0:
-            dict_labelD = self._labelsD_store[idx]
+        # Single {'label_idx','label','displ'} entry list, dilated to the WIDE
+        # radi_displacement_sup radius; narrowed to radi_displacement below wherever
+        # a score/classification label (rather than labelD) is being filled.
+        entries = self._entries_store[idx]
 
         # Load frames
         frames, hands, objects = self._frame_reader.load_frames(frames_path, pad=True, stride=self._stride)
@@ -702,52 +706,55 @@ class ActionSpotDataset(Dataset):
 
         if self._soft_labels and num_classes > 2:
             # Multi-class soft labels: (L, C) — independent gaussian bell curve per class.
-            # dict_label and dict_labelD are built in parallel in _store_clips so they
-            # can be zipped to recover the (class, displacement) pair for each entry.
             labels = np.zeros((self._clip_len, num_classes), np.float32)
 
             if self._radi_displacement > 0:
-                # Gaussian pass covers the full window including d=0 (peak=1.0),
-                # so no separate initial pass needed.
                 # labelD is per-class (L, C_fg): class-agnostic displacement would let
                 # one class's frame-shift relocate another class's score mass (see
                 # margin-vs-background loss notes), so each fg class keeps its own
-                # nearest-event displacement. 0 is a legitimate displacement value, so
-                # a separate "set" mask (not 0) marks which (frame, class) cells have
-                # been assigned an event yet.
+                # nearest-event displacement, supervised out to the WIDE radius
+                # (radi_displacement_sup) since displacement truth is unambiguous at any
+                # distance. 0 is a legitimate displacement value, so a separate "set"
+                # mask (not 0) marks which (frame, class) cells have been assigned an
+                # event yet.
                 labelsD = np.zeros((self._clip_len, C_fg), np.float32)
                 labelsD_set = np.zeros((self._clip_len, C_fg), dtype=bool)
-                for lbl, lblD in zip(dict_label, dict_labelD):
-                    i, c, d = lbl['label_idx'], lbl['label'], lblD['displ']
+                for e in entries:
+                    i, c, d = e['label_idx'], e['label'], e['displ']
                     col = c - 1
                     if (not labelsD_set[i, col]) or abs(d) < abs(labelsD[i, col]):
                         labelsD[i, col] = d
                         labelsD_set[i, col] = True
-                    labels[i, c] = max(labels[i, c], self._gaussian_labels[d])
+                    # Score gaussian stays at the NARROW radius: self._gaussian_labels is
+                    # only sized (and only defined) for |d| <= radi_displacement.
+                    if abs(d) <= self._radi_displacement:
+                        labels[i, c] = max(labels[i, c], self._gaussian_labels[d])
             else:
-                # No dilation: hard one-hot labels
-                for lbl in dict_label:
-                    labels[lbl['label_idx'], lbl['label']] = 1.0
+                # No dilation: hard one-hot labels at the exact event frame.
+                for e in entries:
+                    if e.get('displ', 0) == 0:
+                        labels[e['label_idx'], e['label']] = 1.0
         else:
             # Binary soft (L,) float or hard (L,) int — existing behaviour
             labels = np.zeros(self._clip_len, np.int64)
             if self._soft_labels:
                 labels = labels.astype(np.float32)
-            for lbl in dict_label:
-                labels[lbl['label_idx']] = lbl['label']
+            for e in entries:
+                if abs(e.get('displ', 0)) <= self._radi_displacement:
+                    labels[e['label_idx']] = e['label']
 
             if self._radi_displacement > 0:
                 # Per-class labelD (see the multi-class branch above); the classification
                 # target above stays a single scalar per frame (unchanged, out of scope).
                 labelsD = np.zeros((self._clip_len, C_fg), np.float32)
                 labelsD_set = np.zeros((self._clip_len, C_fg), dtype=bool)
-                for lbl, lblD in zip(dict_label, dict_labelD):
-                    i, c, d = lbl['label_idx'], lbl['label'], lblD['displ']
+                for e in entries:
+                    i, c, d = e['label_idx'], e['label'], e['displ']
                     col = c - 1
                     if (not labelsD_set[i, col]) or abs(d) < abs(labelsD[i, col]):
                         labelsD[i, col] = d
                         labelsD_set[i, col] = True
-                    if self._soft_labels:
+                    if self._soft_labels and abs(d) <= self._radi_displacement:
                         labels[i] = self._gaussian_labels[d]
 
         clip_data = {'frame': frames,

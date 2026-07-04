@@ -42,6 +42,7 @@ mixup: false
 
 # Loss configuration
 radi_displacement: 4
+radi_displacement_sup: 8   # wider labelD supervision radius (score-label radius stays at radi_displacement)
 loss:
   type: focal  # Options: ce, focal
 
