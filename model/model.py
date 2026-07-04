@@ -1106,11 +1106,15 @@ class TDEEDModel(BaseRGBModel):
                 pred = _pred['im_feat']
                 if isinstance(pred, list):
                     pred = pred[0]
+                # bf16 autocast output -- numpy has no bfloat16 support (unlike the fp16
+                # this replaced), so cast back to fp32 before anything downstream calls .numpy().
+                pred = pred.float()
 
                 if 'displ_feat' in _pred:
                     predD = _pred['displ_feat']
                     if isinstance(predD, list):
                         predD = predD[0]
+                    predD = predD.float()
 
                     raw_pred['predD'] = predD
                     if self._model._double_head:
@@ -1125,6 +1129,7 @@ class TDEEDModel(BaseRGBModel):
 
             if isinstance(pred, tuple):
                 pred = pred[0]
+            pred = pred.float()
             if len(pred.shape) > 3:
                 pred = pred[-1]
             else:
