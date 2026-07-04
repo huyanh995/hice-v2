@@ -802,7 +802,7 @@ class TDEEDModel(BaseRGBModel):
                     else label.view(-1, label.shape[-1])
 
                 ### Main logic of model forward pass ##########################################
-                with torch.amp.autocast(device_type = self.device, enabled = self.amp):
+                with torch.amp.autocast(device_type = self.device, dtype = torch.bfloat16, enabled = self.amp):
                     # pred, y = self._model(frame, y = label, inference=inference)
                     preds, y = self._model(frame, y = label,
                                             left_patches=left_patches, right_patches=right_patches,
@@ -852,6 +852,9 @@ class TDEEDModel(BaseRGBModel):
                     else:
                         predictions = pred.reshape(-1, self._num_classes) # (B*L, C+1)
 
+                        # Mixup builds softmax-style label distributions, incompatible
+                        # with the margin-vs-background multi-label loss.
+                        assert not self._args.mixup
                         # loss += F.cross_entropy(predictions, label, **ce_kwargs)
                         main_loss = self.main_loss(predictions, label)
                         loss += main_loss
@@ -917,7 +920,7 @@ class TDEEDModel(BaseRGBModel):
 
         self._model.eval()
         with torch.no_grad():
-            with torch.amp.autocast('cuda') if use_amp else nullcontext():
+            with torch.amp.autocast('cuda', dtype = torch.bfloat16) if use_amp else nullcontext():
                 _pred, y = self._model(seq, y=None,
                                       left_patches=left_patches, right_patches=right_patches,
                                       left_grasp=left_grasp, right_grasp=right_grasp,
@@ -926,11 +929,15 @@ class TDEEDModel(BaseRGBModel):
                 pred = _pred['im_feat']
                 if isinstance(pred, list):
                     pred = pred[0]
+                # bf16 autocast output -- numpy has no bfloat16 support (unlike the fp16
+                # this replaced), so cast back to fp32 before anything downstream calls .numpy().
+                pred = pred.float()
 
                 if 'displ_feat' in _pred:
                     predD = _pred['displ_feat']
                     if isinstance(predD, list):
                         predD = predD[0]
+                    predD = predD.float()
 
                     raw_pred['predD'] = predD
                     if self._model._double_head:
@@ -945,10 +952,14 @@ class TDEEDModel(BaseRGBModel):
 
             if isinstance(pred, tuple):
                 pred = pred[0]
+            pred = pred.float()
             if len(pred.shape) > 3:
                 pred = pred[-1]
             else:
-                pred = torch.softmax(pred, axis=2)
+                # Margin-vs-background scoring (matches FocalLoss training semantics).
+                fg = torch.sigmoid(pred[..., 1:] - pred[..., :1])
+                bg = 1.0 - fg.max(dim=-1, keepdim=True).values
+                pred = torch.cat([bg, fg], dim=-1)
 
             pred_cls = torch.argmax(pred, axis=2)
             return pred_cls.cpu().numpy(), pred.cpu().numpy(), y

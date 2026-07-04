@@ -47,7 +47,8 @@ class BaseRGBModel(ABCModel):
         else:
             optimizer = base_optimizer(self._get_params(), **opt_args)
 
-        grad_scaler = torch.amp.GradScaler(device=self.device, enabled=self.amp) # supported for cpu though benefits are unclear.
+        # bf16 has fp32's exponent range, so loss scaling (needed to counter fp16 underflow) is unnecessary here.
+        grad_scaler = torch.amp.GradScaler(device=self.device, enabled=False)
 
         return optimizer, grad_scaler
 
@@ -438,6 +439,7 @@ def step(optimizer, scaler, loss, lr_scheduler=None, backward_only=False, max_no
         optimizer.zero_grad()
 
 ### Original process_prediction function ###
+# Retains legacy softmax semantics (not updated for margin-vs-background scoring).
 def process_prediction_orig(pred, predD):
     pred = torch.softmax(pred, axis=2)
     aux_pred = torch.zeros_like(pred)
@@ -450,7 +452,13 @@ def process_prediction_orig(pred, predD):
 
 def process_prediction(pred_logits, predD, temperature=1.0, max_distance=0):
     B, T, C = pred_logits.shape
-    scores = torch.softmax(pred_logits / temperature, dim=2)   # [B,T,C]
+    # Margin-vs-background scoring (matches FocalLoss training semantics): each fg
+    # class is scored by sigmoid of its margin against the shared bg logit; the bg
+    # column is a placeholder (1 - max fg score) so downstream shape/argmax consumers
+    # are unaffected.
+    fg = torch.sigmoid((pred_logits[..., 1:] - pred_logits[..., :1]) / temperature)
+    bg = 1.0 - fg.max(dim=-1, keepdim=True).values
+    scores = torch.cat([bg, fg], dim=-1)                        # [B,T,C]
     dtype, device = scores.dtype, scores.device
 
     # --- sanitize displacement ---
@@ -497,7 +505,7 @@ def process_prediction(pred_logits, predD, temperature=1.0, max_distance=0):
     return fused
 
 def process_double_head(pred, predD, num_classes = 1):
-
+    # Retains legacy softmax semantics (not updated for margin-vs-background scoring).
     pred1 = torch.softmax(pred[:, :, :num_classes], axis=2) #preds 1st head
     aux_pred = torch.zeros_like(pred1)
 

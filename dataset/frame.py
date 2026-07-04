@@ -619,7 +619,6 @@ class ActionSpotDataset(Dataset):
                     i, c, d = lbl['label_idx'], lbl['label'], lblD['displ']
                     labelsD[i] = d
                     labels[i, c] = max(labels[i, c], self._gaussian_labels[d])
-                    labels[i, 0] = 0.0  # bg=0 whenever any fg class is active
             else:
                 # No dilation: hard one-hot labels
                 for lbl in dict_label:

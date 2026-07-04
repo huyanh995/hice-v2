@@ -98,6 +98,8 @@ def update_args(args, config):
     # Optional parameters
     args.pretrain = config.get('pretrain', None)
     args.clip_grad = config.get('clip_grad', None)
+    print(f'[INFO] Gradient clipping set to: {args.clip_grad}')
+
     args.grasp_loss = config.get('grasp_loss', False)
     args.use_kpe = config.get('use_kpe', False)
     args.use_glb_feat = config.get('use_glb_feat', False)
@@ -347,7 +349,9 @@ def main(args):
                 'train': train_loss,
                 'val': val_loss,
                 'val_mAP': val_mAP,
-                'lr': current_lr
+                'lr': current_lr,
+                'train_losses': train_loss_dict,
+                'val_losses': val_loss_dict,
             })
 
             if args.save_dir is not None:
