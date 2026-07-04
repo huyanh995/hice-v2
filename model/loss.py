@@ -36,7 +36,13 @@ class BCELoss(nn.Module):
             eff_w = (1 - y) * self.w_bg + y * self.w_fg
             return loss.sum() / eff_w.sum().clamp_min(1e-8)
 
-        # Multi-class path — targets is (B,) long or (B, C) float distribution
+        # Multi-class path — softmax-distribution based (targets must sum to 1 per
+        # row). The gaussian soft labels used for margin-vs-background training
+        # (see FocalLoss) are NOT distributions, so this path is unsafe for them.
+        if n_cls > 2:
+            raise NotImplementedError(
+                "BCELoss multi-class path assumes softmax-distribution targets; "
+                "use FocalLoss (loss_type='focal') for multi-label gaussian soft labels.")
         if targets.dtype == torch.long:
             y = F.one_hot(targets, n_cls).float()     # (B, C) one-hot
         else:
@@ -98,24 +104,29 @@ class FocalLoss(nn.Module):
             else:
                 loss = mod * bce
         else:
-            # Multi-class path — softmax-based focal loss
+            # Multi-class path — multi-label margin-vs-background focal loss.
+            # Each fg class c is scored independently by its margin against the
+            # shared background logit, m_c = z_c - z_bg, and trained with the same
+            # binary focal math as the n_cls==2 branch above (per-class proper
+            # scoring rule; reduces exactly to the n_cls==2 branch at C=1).
             if targets.dtype == torch.long:
-                y = F.one_hot(targets, n_cls).float()  # (B, C) one-hot
+                y = torch.zeros(targets.shape[0], n_cls - 1, device=inputs.device, dtype=inputs.dtype)
+                fg = targets > 0
+                y[fg, targets[fg] - 1] = 1.0            # (B, C-1); targets==0 -> all-zero row
             else:
-                y = targets                             # (B, C) soft distribution
+                y = targets[:, 1:]                       # (B, C-1) soft labels; column 0 ignored
 
-            log_p = F.log_softmax(inputs, dim=1)
-            p = log_p.exp()
-            p_t = (y * p).sum(dim=1)                   # expected prob of true class(es)
-            ce = -(y * log_p).sum(dim=1)               # soft CE over all classes
+            m = inputs[:, 1:] - inputs[:, :1]           # (B, C-1)
+            bce = F.binary_cross_entropy_with_logits(m, y, reduction="none")
+            p = torch.sigmoid(m)
+            p_t = y * p + (1 - y) * (1 - p)
             mod = (1.0 - p_t).clamp_min(self.eps).pow(self.gamma)
-
             if self.alpha >= 0:
-                # alpha weights fg mass vs bg mass
-                alpha_t = self.alpha * (1 - y[:, 0]) + (1 - self.alpha) * y[:, 0]
-                loss = alpha_t * mod * ce
+                alpha_t = self.alpha * y + (1 - self.alpha) * (1 - y)
+                loss = alpha_t * mod * bce
             else:
-                loss = mod * ce
+                loss = mod * bce
+            loss = loss.mean(dim=1)                     # (B,) mean over classes
 
         if self.reduction == "mean":
             return loss.mean()

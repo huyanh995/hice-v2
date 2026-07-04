@@ -159,9 +159,11 @@ class TDEEDModel(BaseRGBModel):
                 print('[INFO] Using GRU')
 
             if self._radi_displacement > 0:
-                # self._pred_displ = FCLayers(self._feat_dim, 1)
-                self._pred_displ = FCLayers(radi_input_dim, 1)
-                print(f'[INFO] Using displacement with {self._radi_displacement} radius.')
+                # One displacement channel per fg class (no bg column): a shared,
+                # class-agnostic displacement lets one class's frame-shift relocate
+                # another class's score mass under multi-label scoring.
+                self._pred_displ = FCLayers(radi_input_dim, args.num_classes)
+                print(f'[INFO] Using per-class displacement ({args.num_classes} classes) with {self._radi_displacement} radius.')
 
             self._obj_head = getattr(args, 'obj_head', False)
 
@@ -371,7 +373,7 @@ class TDEEDModel(BaseRGBModel):
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat).squeeze(-1) # (B, L) -> regression displacement for each frame
+                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
                     im_feat = self._pred_fine(im_feat) # (B, L, num_classes+1) -> class predictions for each frame
                     # return {'im_feat': im_feat, 'displ_feat': displ_feat}, y
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
@@ -387,7 +389,7 @@ class TDEEDModel(BaseRGBModel):
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat).squeeze(-1)
+                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
                 else:
@@ -397,7 +399,7 @@ class TDEEDModel(BaseRGBModel):
             else:
                 im_feat = self._temp_fine(im_feat) # (6, 40, 1536)
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat).squeeze(-1)
+                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
                 else:
@@ -855,6 +857,8 @@ class TDEEDModel(BaseRGBModel):
                     label2 = label2.to(self.device)
 
                     if 'labelD2' in batch.keys():
+                        # Assumes scalar (B, L) displacement, pre-dating per-class labelD;
+                        # unreachable in practice since mixup is asserted False below.
                         labelD2 = batch['labelD2'].to(self.device).float()
                         labelD_dist = torch.zeros((labelD.shape[0], label.shape[1])).to(self.device)
 
@@ -949,6 +953,9 @@ class TDEEDModel(BaseRGBModel):
                     else:
                         predictions = pred.reshape(-1, self._num_classes) # (B*L, C+1)
 
+                        # Mixup builds softmax-style label distributions, incompatible
+                        # with the margin-vs-background multi-label loss.
+                        assert not self._args.mixup
                         # loss += F.cross_entropy(predictions, label, **ce_kwargs)
                         main_loss = self.main_loss(predictions, label)
                         loss += main_loss
@@ -1133,7 +1140,10 @@ class TDEEDModel(BaseRGBModel):
             if len(pred.shape) > 3:
                 pred = pred[-1]
             else:
-                pred = torch.softmax(pred, axis=2)
+                # Margin-vs-background scoring (matches FocalLoss training semantics).
+                fg = torch.sigmoid(pred[..., 1:] - pred[..., :1])
+                bg = 1.0 - fg.max(dim=-1, keepdim=True).values
+                pred = torch.cat([bg, fg], dim=-1)
 
             pred_cls = torch.argmax(pred, axis=2)
             return pred_cls.cpu().numpy(), pred.cpu().numpy(), y
