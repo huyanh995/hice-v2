@@ -1,6 +1,6 @@
-frame_dir: /home/ha/TouchMoment/Frames
-save_dir: /home/ha/HOI4D-v3_Exp/save
-store_dir: /home/ha/HOI4D-v3_Exp/store
+frame_dir: /data/CVPR26_HiCE/TouchMoment/Frames
+save_dir: /data/HOI4D-v3_Exp/save
+store_dir: /data/HOI4D-v3_Exp/store
 store_mode: load
 
 # Dataset
@@ -40,10 +40,10 @@ lambda_presence: 0.75    # weight of presence BCE within the object-branch loss 
 presence_tau: 0.1        # max-cell-coverage threshold for the y_obj presence label
 
 # Data loading
-batch_size: 6
+batch_size: 1
 clip_len: 40
 crop_dim: 224
-num_workers: 4
+num_workers: 1
 
 # Model
 feature_arch: rny008_gsf
@@ -61,6 +61,7 @@ learning_rate: 0.0004
 acc_grad_iter: 1 # gradient accumulation steps
 epoch_num_frames: 200000
 mixup: false
+clip_grad: 1.0
 
 # Loss configuration
 radi_displacement: 4
