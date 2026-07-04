@@ -439,7 +439,8 @@ def step(optimizer, scaler, loss, lr_scheduler=None, backward_only=False, max_no
         optimizer.zero_grad()
 
 ### Original process_prediction function ###
-# Retains legacy softmax semantics (not updated for margin-vs-background scoring).
+# Retains legacy softmax semantics (not updated for margin-vs-background scoring)
+# and assumes a scalar (B, T) displacement, not the per-class (B, T, C) tensor.
 def process_prediction_orig(pred, predD):
     pred = torch.softmax(pred, axis=2)
     aux_pred = torch.zeros_like(pred)
@@ -453,21 +454,18 @@ def process_prediction_orig(pred, predD):
 def process_prediction(pred_logits, predD, temperature=1.0, max_distance=0):
     B, T, C = pred_logits.shape
     # Margin-vs-background scoring (matches FocalLoss training semantics): each fg
-    # class is scored by sigmoid of its margin against the shared bg logit; the bg
-    # column is a placeholder (1 - max fg score) so downstream shape/argmax consumers
-    # are unaffected.
-    fg = torch.sigmoid((pred_logits[..., 1:] - pred_logits[..., :1]) / temperature)
-    bg = 1.0 - fg.max(dim=-1, keepdim=True).values
-    scores = torch.cat([bg, fg], dim=-1)                        # [B,T,C]
-    dtype, device = scores.dtype, scores.device
+    # class is scored by sigmoid of its margin against the shared bg logit.
+    fg = torch.sigmoid((pred_logits[..., 1:] - pred_logits[..., :1]) / temperature)  # [B,T,C-1]
+    bg = 1.0 - fg.max(dim=-1, keepdim=True).values                                   # [B,T,1]
+    dtype, device = fg.dtype, fg.device
 
-    # --- sanitize displacement ---
+    # --- sanitize per-class displacement --- predD: [B,T,C-1], one pointer per fg class
     disp = predD.to(dtype)
     disp = torch.nan_to_num(disp, nan=0.0, posinf=0.0, neginf=0.0)
 
-    # centers
-    t_idx   = torch.arange(T, device=device, dtype=dtype)[None, :]
-    centers = t_idx - disp   # [B,T]
+    # centers, per class
+    t_idx   = torch.arange(T, device=device, dtype=dtype)[None, :, None]  # [1,T,1]
+    centers = t_idx - disp   # [B,T,C-1]
 
     f0 = torch.floor(centers)
     f1 = f0 + 1
@@ -477,35 +475,37 @@ def process_prediction(pred_logits, predD, temperature=1.0, max_distance=0):
     valid1 = (f1 >= 0) & (f1 < T)
 
     # safe cast
-    f0 = f0.clamp(0, T-1).to(torch.long)
+    f0 = f0.clamp(0, T-1).to(torch.long)   # [B,T,C-1]
     f1 = f1.clamp(0, T-1).to(torch.long)
-    alpha = (centers - f0.to(dtype)).unsqueeze(-1)  # [B,T,1]
+    alpha = centers - f0.to(dtype)          # [B,T,C-1]
 
     # Gaussian decay
     if max_distance > 0:
         sigma = max_distance / math.sqrt(2 * math.log(10))
-        decay = torch.exp(-(disp.abs()**2) / (2 * sigma**2)).unsqueeze(-1)
+        decay = torch.exp(-(disp.abs()**2) / (2 * sigma**2))   # [B,T,C-1]
     else:
         decay = 1.0
 
-    s0 = decay * (1 - alpha) * scores
-    s1 = decay * alpha * scores
+    s0 = decay * (1 - alpha) * fg
+    s1 = decay * alpha * fg
 
     # mask invalid votes
-    s0 = s0 * valid0.unsqueeze(-1)
-    s1 = s1 * valid1.unsqueeze(-1)
+    s0 = s0 * valid0
+    s1 = s1 * valid1
 
-    f0e = f0.unsqueeze(-1).expand(-1, -1, C)
-    f1e = f1.unsqueeze(-1).expand(-1, -1, C)
+    # Each class column is shifted independently (index shapes already match fg's
+    # (B,T,C-1), no .expand needed) -- unlike the legacy scalar-displacement path,
+    # one class's shift can no longer relocate another class's score mass.
+    fused_fg = torch.zeros_like(fg)
+    fused_fg.scatter_reduce_(1, f0, s0, reduce="amax", include_self=True)
+    fused_fg.scatter_reduce_(1, f1, s1, reduce="amax", include_self=True)
 
-    fused = torch.zeros_like(scores)
-    fused.scatter_reduce_(1, f0e, s0, reduce="amax", include_self=True)
-    fused.scatter_reduce_(1, f1e, s1, reduce="amax", include_self=True)
-
-    return fused
+    # bg has no class/displacement of its own -- carried through unshifted.
+    return torch.cat([bg, fused_fg], dim=-1)   # [B,T,C]
 
 def process_double_head(pred, predD, num_classes = 1):
-    # Retains legacy softmax semantics (not updated for margin-vs-background scoring).
+    # Retains legacy softmax semantics (not updated for margin-vs-background scoring)
+    # and assumes a scalar (B, T) displacement, not the per-class (B, T, C) tensor.
     pred1 = torch.softmax(pred[:, :, :num_classes], axis=2) #preds 1st head
     aux_pred = torch.zeros_like(pred1)
 
@@ -522,9 +522,14 @@ def process_labels(label, labelD, num_classes = 18):
     label_aux[:, :, 0] = 1 #Background class
     events = label.nonzero()
     for i in range(events.shape[0]):
-        if ((events[i, 1] - int(labelD[events[i, 0], events[i, 1]])) < label.shape[1]) & ((events[i, 1] - int(labelD[events[i, 0], events[i, 1]])) >= 0):
-            label_aux[events[i, 0], events[i, 1] - int(labelD[events[i, 0], events[i, 1]]), label[events[i, 0], events[i, 1]]] = 1
-            label_aux[events[i, 0], events[i, 1] - int(labelD[events[i, 0], events[i, 1]]), 0] = 0
+        b, t = events[i, 0], events[i, 1]
+        c = label[b, t]
+        # labelD is per-class (B, T, C_fg) -- look up this event's own class column
+        # rather than a single scalar-per-frame displacement.
+        d = int(labelD[b, t, c - 1])
+        if (t - d) < label.shape[1] and (t - d) >= 0:
+            label_aux[b, t - d, c] = 1
+            label_aux[b, t - d, 0] = 0
 
     return label_aux
 

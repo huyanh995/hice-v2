@@ -159,9 +159,11 @@ class TDEEDModel(BaseRGBModel):
                 print('[INFO] Using GRU')
 
             if self._radi_displacement > 0:
-                # self._pred_displ = FCLayers(self._feat_dim, 1)
-                self._pred_displ = FCLayers(radi_input_dim, 1)
-                print(f'[INFO] Using displacement with {self._radi_displacement} radius.')
+                # One displacement channel per fg class (no bg column): a shared,
+                # class-agnostic displacement lets one class's frame-shift relocate
+                # another class's score mass under multi-label scoring.
+                self._pred_displ = FCLayers(radi_input_dim, args.num_classes)
+                print(f'[INFO] Using per-class displacement ({args.num_classes} classes) with {self._radi_displacement} radius.')
 
             self._grasp_loss = args.grasp_loss
 
@@ -314,7 +316,7 @@ class TDEEDModel(BaseRGBModel):
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat).squeeze(-1) # (B, L) -> regression displacement for each frame
+                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
                     im_feat = self._pred_fine(im_feat) # (B, L, num_classes+1) -> class predictions for each frame
                     # return {'im_feat': im_feat, 'displ_feat': displ_feat}, y
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
@@ -330,7 +332,7 @@ class TDEEDModel(BaseRGBModel):
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat).squeeze(-1)
+                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
                 else:
@@ -340,7 +342,7 @@ class TDEEDModel(BaseRGBModel):
             else:
                 im_feat = self._temp_fine(im_feat) # (6, 40, 1536)
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat).squeeze(-1)
+                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
                 else:
@@ -769,6 +771,8 @@ class TDEEDModel(BaseRGBModel):
                     label2 = label2.to(self.device)
 
                     if 'labelD2' in batch.keys():
+                        # Assumes scalar (B, L) displacement, pre-dating per-class labelD;
+                        # unreachable in practice since mixup is asserted False below.
                         labelD2 = batch['labelD2'].to(self.device).float()
                         labelD_dist = torch.zeros((labelD.shape[0], label.shape[1])).to(self.device)
 

@@ -604,6 +604,7 @@ class ActionSpotDataset(Dataset):
 
         # Process labels
         num_classes = len(self._class_dict) + 1  # bg + all fg classes
+        C_fg = len(self._class_dict)              # fg-class count, no bg column
 
         if self._soft_labels and num_classes > 2:
             # Multi-class soft labels: (L, C) — independent gaussian bell curve per class.
@@ -614,10 +615,20 @@ class ActionSpotDataset(Dataset):
             if self._radi_displacement > 0:
                 # Gaussian pass covers the full window including d=0 (peak=1.0),
                 # so no separate initial pass needed.
-                labelsD = np.zeros(self._clip_len, np.int64)
+                # labelD is per-class (L, C_fg): class-agnostic displacement would let
+                # one class's frame-shift relocate another class's score mass (see
+                # margin-vs-background loss notes), so each fg class keeps its own
+                # nearest-event displacement. 0 is a legitimate displacement value, so
+                # a separate "set" mask (not 0) marks which (frame, class) cells have
+                # been assigned an event yet.
+                labelsD = np.zeros((self._clip_len, C_fg), np.float32)
+                labelsD_set = np.zeros((self._clip_len, C_fg), dtype=bool)
                 for lbl, lblD in zip(dict_label, dict_labelD):
                     i, c, d = lbl['label_idx'], lbl['label'], lblD['displ']
-                    labelsD[i] = d
+                    col = c - 1
+                    if (not labelsD_set[i, col]) or abs(d) < abs(labelsD[i, col]):
+                        labelsD[i, col] = d
+                        labelsD_set[i, col] = True
                     labels[i, c] = max(labels[i, c], self._gaussian_labels[d])
             else:
                 # No dilation: hard one-hot labels
@@ -628,15 +639,22 @@ class ActionSpotDataset(Dataset):
             labels = np.zeros(self._clip_len, np.int64)
             if self._soft_labels:
                 labels = labels.astype(np.float32)
-            for label in dict_label:
-                labels[label['label_idx']] = label['label']
+            for lbl in dict_label:
+                labels[lbl['label_idx']] = lbl['label']
 
             if self._radi_displacement > 0:
-                labelsD = np.zeros(self._clip_len, np.int64)
-                for label in dict_labelD:
-                    labelsD[label['label_idx']] = label['displ']
+                # Per-class labelD (see the multi-class branch above); the classification
+                # target above stays a single scalar per frame (unchanged, out of scope).
+                labelsD = np.zeros((self._clip_len, C_fg), np.float32)
+                labelsD_set = np.zeros((self._clip_len, C_fg), dtype=bool)
+                for lbl, lblD in zip(dict_label, dict_labelD):
+                    i, c, d = lbl['label_idx'], lbl['label'], lblD['displ']
+                    col = c - 1
+                    if (not labelsD_set[i, col]) or abs(d) < abs(labelsD[i, col]):
+                        labelsD[i, col] = d
+                        labelsD_set[i, col] = True
                     if self._soft_labels:
-                        labels[label['label_idx']] = self._gaussian_labels[label['displ']]
+                        labels[i] = self._gaussian_labels[d]
 
         clip_data = {'frame': frames,
                     'contains_event': int(np.sum(labels) > 0),

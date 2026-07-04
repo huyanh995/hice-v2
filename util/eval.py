@@ -253,7 +253,7 @@ def evaluate(model, dataset, split, classes, tolerances=TOLERANCES, windows=WIND
                 scores, support = pred_dict[video]
                 pred_scores = batch_pred_scores[i]
                 _pred = feat['pred'][i] # (L, 2)
-                _predD = feat['predD'][i] if feat['predD'] is not None else None # (L, )
+                _predD = feat['predD'][i] if feat['predD'] is not None else None # (L, C) -- per-class displacement, sliced along L below
 
                 start = clip['start'][i].item()
                 if start < 0:
@@ -288,7 +288,7 @@ def evaluate(model, dataset, split, classes, tolerances=TOLERANCES, windows=WIND
             scores, support = pred_dict[clip['video'][0]]
 
             _pred = feat['pred'][0] # (L, 2)
-            _predD = feat['predD'][0] if feat['predD'] is not None else None # (L, )
+            _predD = feat['predD'][0] if feat['predD'] is not None else None # (L, C) -- per-class displacement, sliced along L below
 
             start = clip['start'][0].item()
 
