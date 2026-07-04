@@ -98,6 +98,7 @@ def update_args(args, config):
     # Optional parameters
     args.pretrain = config.get('pretrain', None)
     args.clip_grad = config.get('clip_grad', None)
+    print('[INFO] Gradient clipping is set to: ', args.clip_grad)
     args.grasp_loss = config.get('grasp_loss', False)
     args.use_kpe = config.get('use_kpe', False)
     args.use_glb_feat = config.get('use_glb_feat', False)

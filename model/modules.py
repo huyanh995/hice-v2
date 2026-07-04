@@ -42,19 +42,37 @@ class BaseRGBModel(ABCModel):
 
     def get_optimizer(self, opt_args, sam_args=None):
         base_optimizer = torch.optim.AdamW
-        if sam_args is not None:
-            optimizer = SAMOptimizer(self._get_params(), base_optimizer, **opt_args, **sam_args)
-        else:
-            optimizer = base_optimizer(self._get_params(), **opt_args)
 
-        grad_scaler = torch.amp.GradScaler(device=self.device, enabled=self.amp) # supported for cpu though benefits are unclear.
+        # Decoupled weight decay: biases, norm params, and scalar gates (e.g. the
+        # zero-init fusion _gamma) must not be decayed toward zero, or the decay
+        # term becomes a constant force fighting whatever the gradient is trying
+        # to do with them (most consequential for a zero-init scalar like _gamma,
+        # which decay would otherwise pin at zero).
+        weight_decay = opt_args.pop('weight_decay', 0.01)
+        decay, no_decay = [], []
+        for name, p in self._model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if p.ndim <= 1 or name.endswith('_gamma'):
+                no_decay.append(p)
+            else:
+                decay.append(p)
+        param_groups = [
+            {'params': decay, 'weight_decay': weight_decay},
+            {'params': no_decay, 'weight_decay': 0.0},
+        ]
+
+        if sam_args is not None:
+            optimizer = SAMOptimizer(param_groups, base_optimizer, **opt_args, **sam_args)
+        else:
+            optimizer = base_optimizer(param_groups, **opt_args)
+
+        # bf16 has fp32's exponent range, so loss scaling (needed to counter fp16 underflow) is unnecessary here.
+        grad_scaler = torch.amp.GradScaler(device=self.device, enabled=False)
 
         return optimizer, grad_scaler
 
     """ Assume there is a self._model """
-
-    def _get_params(self):
-        return list(self._model.parameters())
 
     def state_dict(self):
         if isinstance(self._model, nn.DataParallel):
