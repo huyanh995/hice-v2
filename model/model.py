@@ -159,11 +159,20 @@ class TDEEDModel(BaseRGBModel):
                 print('[INFO] Using GRU')
 
             if self._radi_displacement > 0:
-                # One displacement channel per fg class (no bg column): a shared,
-                # class-agnostic displacement lets one class's frame-shift relocate
-                # another class's score mass under multi-label scoring.
-                self._pred_displ = FCLayers(radi_input_dim, args.num_classes)
-                print(f'[INFO] Using per-class displacement ({args.num_classes} classes) with {self._radi_displacement} radius.')
+                # class_aware_displacement=True: one displacement channel per fg class
+                # (no bg column) -- a shared, class-agnostic displacement lets one
+                # class's frame-shift relocate another class's score mass under
+                # multi-label scoring. =False restores the legacy single shared
+                # channel (kept for ablation), expanded to (B,L,C_fg) in forward()
+                # so the rest of the pipeline doesn't need to branch on this flag.
+                self._class_aware_displacement = getattr(args, 'class_aware_displacement', True)
+                self._displ_num_classes = args.num_classes
+                displ_out_dim = args.num_classes if self._class_aware_displacement else 1
+                self._pred_displ = FCLayers(radi_input_dim, displ_out_dim)
+                if self._class_aware_displacement:
+                    print(f'[INFO] Using per-class displacement ({args.num_classes} classes) with {self._radi_displacement} radius.')
+                else:
+                    print(f'[INFO] Using legacy scalar (class-agnostic) displacement with {self._radi_displacement} radius.')
 
             self._obj_head = getattr(args, 'obj_head', False)
 
@@ -247,6 +256,13 @@ class TDEEDModel(BaseRGBModel):
             # self.cropI = T.CenterCrop((self.croping, self.croping))
             self.cropI = torch.nn.Identity()
 
+        def _expand_displ(self, displ_feat):
+            # See class_aware_displacement note near self._pred_displ: legacy mode
+            # predicts one shared channel, broadcast here to (B,L,C_fg) so downstream
+            # code (loss, process_prediction/process_labels) stays shape-agnostic.
+            if not self._class_aware_displacement:
+                displ_feat = displ_feat.expand(-1, -1, self._displ_num_classes)
+            return displ_feat
 
         def forward(self, frames,
                     left_patches, right_patches,
@@ -373,7 +389,7 @@ class TDEEDModel(BaseRGBModel):
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
+                    displ_feat = self._expand_displ(self._pred_displ(im_feat)) # (B, L, C) -> per-class (or broadcast legacy scalar) displacement for each frame
                     im_feat = self._pred_fine(im_feat) # (B, L, num_classes+1) -> class predictions for each frame
                     # return {'im_feat': im_feat, 'displ_feat': displ_feat}, y
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
@@ -389,7 +405,7 @@ class TDEEDModel(BaseRGBModel):
                 if inference:
                     feat_save['temporal'] = im_feat.detach().clone().cpu()
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
+                    displ_feat = self._expand_displ(self._pred_displ(im_feat)) # (B, L, C) -> per-class (or broadcast legacy scalar) displacement for each frame
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
                 else:
@@ -399,7 +415,7 @@ class TDEEDModel(BaseRGBModel):
             else:
                 im_feat = self._temp_fine(im_feat) # (6, 40, 1536)
                 if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
+                    displ_feat = self._expand_displ(self._pred_displ(im_feat)) # (B, L, C) -> per-class (or broadcast legacy scalar) displacement for each frame
                     im_feat = self._pred_fine(im_feat)
                     res = {'im_feat': im_feat, 'displ_feat': displ_feat}
                 else:

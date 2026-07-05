@@ -78,6 +78,7 @@ def build_args(config, device):
     args.sgp_ks            = config['sgp_ks']
     args.sgp_r             = config['sgp_r']
     args.radi_displacement = config['radi_displacement']
+    args.class_aware_displacement = config.get('class_aware_displacement', True)
     args.amp               = config.get('amp', True)
     args.grasp_loss        = config.get('grasp_loss', False)
     args.obj_head          = config.get('obj_head', False)

@@ -66,6 +66,7 @@ def update_args(args, config):
     args.crop_dim = config['crop_dim']
     args.dataset = config['dataset']
     args.radi_displacement = config['radi_displacement']
+    args.class_aware_displacement = config.get('class_aware_displacement', True)
     args.epoch_num_frames = config['epoch_num_frames']
     args.feature_arch = config['feature_arch']
     args.learning_rate = config['learning_rate']
