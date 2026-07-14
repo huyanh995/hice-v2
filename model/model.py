@@ -51,11 +51,42 @@ class TDEEDModel(BaseRGBModel):
             self._radi_displacement = args.radi_displacement
 
             self._feature_arch = args.feature_arch
-            assert 'rny' in self._feature_arch, 'Only rny supported for now'
+            # VJEPA 2.1 backbones are named vjepa2_1_vit_{base,large,giant,gigantic}_384,
+            # loaded straight off the torch.hub entrypoint of the same name.
+            self._vjepa = self._feature_arch.startswith('vjepa2_1_vit_')
+            assert 'rny' in self._feature_arch or self._vjepa, \
+                'Only rny or vjepa2_1_vit_* backbones supported for now'
 
             self._double_head = False
 
-            if self._feature_arch.startswith(('rny002', 'rny008')):
+            if self._vjepa:
+                # Frozen video-clip backbone: no gradients, permanently eval() (see the
+                # train() override below, which re-pins this to eval whenever the outer
+                # model toggles train/eval -- otherwise a plain .train() call would turn
+                # its internal dropout back on).
+                encoder, _ = torch.hub.load('facebookresearch/vjepa2', self._feature_arch)
+                for p in encoder.parameters():
+                    p.requires_grad_(False)
+                encoder.eval()
+
+                features = encoder
+                self._d = encoder.embed_dim
+                self._vjepa_patch = encoder.patch_size
+                self._vjepa_tubelet = encoder.tubelet_size
+                self._vjepa_res = int(self._feature_arch.rsplit('_', 1)[-1])  # e.g. 384
+
+                n_params = sum(p.numel() for p in encoder.parameters())
+                print(f'[INFO] Loaded frozen {self._feature_arch} (VJEPA 2.1) backbone, '
+                      f'{n_params / 1e6:.1f}M params (frozen), embed_dim={self._d}, '
+                      f'patch={self._vjepa_patch}, tubelet={self._vjepa_tubelet}, '
+                      f'native res={self._vjepa_res}.')
+
+                # No timm ClassifierHead available for a raw ViT encoder -- plain global
+                # average pool + flatten mimics the same (N,C,H,W) -> (N,C) contract the
+                # rny path's cls_head provides everywhere else in this module.
+                self.cls_head = nn.Sequential(nn.AdaptiveAvgPool2d(1), nn.Flatten(1))
+
+            elif self._feature_arch.startswith(('rny002', 'rny008')):
                 features = timm.create_model({
                     'rny002': 'regnety_002',
                     'rny008': 'regnety_008',
@@ -97,7 +128,19 @@ class TDEEDModel(BaseRGBModel):
             self._feat_dim = self._d
             # ------
             # Hand patch extractor
-            if not args.share_enc:
+            if self._vjepa:
+                # No separate hand encoder: hand features are RoIAlign-cropped directly out
+                # of the (already-computed, frozen) VJEPA scene feature map in forward() --
+                # see the self._vjepa branch there. Requires left_hand_box/right_hand_box
+                # (scene-crop-relative pixel boxes from dataset/frame.py) at call time.
+                self._hand_enc = None
+                if args.share_enc:
+                    print('[WARN] --share_enc has no effect with a VJEPA backbone (there is '
+                          'no separate hand encoder to share) -- ignoring.')
+                print('[INFO] VJEPA backbone selected -- hand features are RoIAlign-cropped '
+                      'from the scene feature map, no separate hand encoder.')
+
+            elif not args.share_enc:
                 self._hand_enc = timm.create_model({
                     'rny002': 'regnety_002',
                     'rny008': 'regnety_008',
@@ -247,10 +290,20 @@ class TDEEDModel(BaseRGBModel):
             # self.cropI = T.CenterCrop((self.croping, self.croping))
             self.cropI = torch.nn.Identity()
 
+        def train(self, mode=True):
+            # Keep the frozen VJEPA backbone permanently in eval() (dropout etc. off)
+            # regardless of the outer model's train()/eval() toggling -- a plain
+            # super().train(mode) would otherwise flip it back to train mode too.
+            super().train(mode)
+            if self._vjepa:
+                self._features.eval()
+            return self
 
         def forward(self, frames,
                     left_patches, right_patches,
                     left_grasp, right_grasp,
+                    left_hand_box = None, right_hand_box = None,
+                    left_box_valid = None, right_box_valid = None,
                     y = None,
                     inference = False, augment_inference = False):
             # frames: (B, L, C, H, W)
@@ -290,27 +343,99 @@ class TDEEDModel(BaseRGBModel):
                     # Flip the patches as its side changed.
                     left_patches, right_patches = right_patches, left_patches
 
+                    if self._vjepa and left_hand_box is not None and right_hand_box is not None:
+                        # Boxes are coordinate-only (H is still crop_dim here, pre-VJEPA-resize)
+                        # -- mirror x and swap sides, same as the patches above.
+                        def _flip_box(box):
+                            flipped = box.clone()
+                            flipped[..., 0] = W - box[..., 2]
+                            flipped[..., 2] = W - box[..., 0]
+                            return flipped
+                        left_hand_box, right_hand_box = _flip_box(right_hand_box), _flip_box(left_hand_box)
+                        if left_box_valid is not None:
+                            left_box_valid, right_box_valid = right_box_valid, left_box_valid
+
                 x = self.standarize(x) # (B, L, C, H, W)
                 left_patches = self.standarize(left_patches)    # (B, L, 3, 224, 224)
                 right_patches = self.standarize(right_patches)  # (B, L, 3, 224, 224)
 
             ##### Extracting visual feature #####
-            # Before global pooling: (B*L, 768, 7, 7)
-            im_feat = self._features(
-                x.view(-1, C, H, W) # (B*L, 3, 224, 224)
-            ) # (B*L, 768, 7, 7) -> important!!!
+            if self._vjepa:
+                # VJEPA encodes the whole clip at once (B, C, L, H, W), not per-frame, and
+                # needs its native training resolution -- resize here so the rest of the
+                # pipeline (hand-centric cropping, obj_head target rendering, etc.) can keep
+                # using crop_dim (e.g. 224) unchanged.
+                x_flat = x.reshape(B * L, C, H, W)
+                if (H, W) != (self._vjepa_res, self._vjepa_res):
+                    x_flat = F.interpolate(x_flat, size=(self._vjepa_res, self._vjepa_res),
+                                            mode='bilinear', align_corners=False)
+                video = x_flat.view(B, L, C, self._vjepa_res, self._vjepa_res).permute(0, 2, 1, 3, 4)
+
+                assert L % self._vjepa_tubelet == 0, \
+                    f'clip_len ({L}) must be a multiple of the VJEPA tubelet size ({self._vjepa_tubelet})'
+                with torch.no_grad():
+                    tokens = self._features(video)  # (B, (L/tubelet)*Gh*Gw, D)
+
+                # Named Gh/Gw (not Hp/Wp) -- Hp/Wp already mean hand-patch height/width
+                # later in this function; reusing them here would silently clobber those.
+                Gh = Gw = self._vjepa_res // self._vjepa_patch
+                Tp = L // self._vjepa_tubelet
+                tokens = tokens.view(B, Tp, Gh, Gw, self._d)
+                # Each token covers `tubelet` consecutive frames -- trilinear-interpolate
+                # back to L temporal steps (dense, not a repeat_interleave duplicate) so
+                # every one of the L original frames gets its own feature map, matching the
+                # per-frame (B*L, D, H, W) contract the rest of forward() expects. Only the
+                # temporal axis is resampled (spatial scale_factor=1.0).
+                align = tokens.permute(0, 4, 1, 2, 3)  # (B, D, Tp, Gh, Gw) -- interpolate wants channels-first
+                align = F.interpolate(align.float(), scale_factor=(float(self._vjepa_tubelet), 1.0, 1.0),
+                                       mode='trilinear', align_corners=False)  # (B, D, L, Gh, Gw)
+                align = align.to(tokens.dtype)
+                im_feat = align.permute(0, 2, 1, 3, 4).reshape(B * L, self._d, Gh, Gw).contiguous()
+            else:
+                # Before global pooling: (B*L, 768, 7, 7)
+                im_feat = self._features(
+                    x.view(-1, C, H, W) # (B*L, 3, 224, 224)
+                ) # (B*L, 768, 7, 7) -> important!!!
 
             if inference:
                 feat_save = {}
                 feat_save['bb'] = self.cls_head(im_feat).reshape(B, L, self._d).detach().clone().cpu()
 
             # Encode hand patches.
-            left_feat = self._hand_enc(
-                left_patches.view(-1, Cp, Hp, Wp)
-            )
-            right_feat = self._hand_enc(
-                right_patches.view(-1, Cp, Hp, Wp)
-            )
+            if self._vjepa:
+                assert left_hand_box is not None and right_hand_box is not None, \
+                    'VJEPA backbone requires left_hand_box/right_hand_box (from dataset/frame.py)'
+                # RoIAlign the hand regions straight out of the scene feature map instead of
+                # re-encoding a separately-cropped patch -- reuses the (frozen) VJEPA compute
+                # already spent on im_feat rather than running a second encoder over hands.
+                # spatial_scale maps box pixel coords (in the pre-resize crop, i.e. H x H) to
+                # im_feat's Gh x Gh grid; the 384-resize above doesn't change this mapping,
+                # since both the resize and patch tokenization are uniform scalings of the crop.
+                spatial_scale = Gh / H
+                batch_idx = torch.arange(B * L, device=im_feat.device, dtype=torch.float32).unsqueeze(1)
+                left_boxes = torch.cat([batch_idx, left_hand_box.reshape(B * L, 4).float()], dim=1)
+                right_boxes = torch.cat([batch_idx, right_hand_box.reshape(B * L, 4).float()], dim=1)
+                left_feat = roi_align(im_feat.float(), left_boxes, output_size=(7, 7),
+                                       spatial_scale=spatial_scale, sampling_ratio=-1, aligned=True
+                                       ).to(im_feat.dtype)
+                right_feat = roi_align(im_feat.float(), right_boxes, output_size=(7, 7),
+                                        spatial_scale=spatial_scale, sampling_ratio=-1, aligned=True
+                                        ).to(im_feat.dtype)
+
+                # Cross-attention masking below still gates purely on the grasp-derived
+                # flag (unchanged) -- this is just cosmetic cleanup so a placeholder-box
+                # entry reads as a clean zero feature rather than a meaningless crop of a
+                # single corner pixel, since it's excluded from cross-attention either way.
+                if left_box_valid is not None:
+                    left_feat = left_feat * left_box_valid.reshape(B * L, 1, 1, 1)
+                    right_feat = right_feat * right_box_valid.reshape(B * L, 1, 1, 1)
+            else:
+                left_feat = self._hand_enc(
+                    left_patches.view(-1, Cp, Hp, Wp)
+                )
+                right_feat = self._hand_enc(
+                    right_patches.view(-1, Cp, Hp, Wp)
+                )
             # Both are (B*L, 768, 7, 7)
 
             _, _, Nc = left_grasp.shape
@@ -333,9 +458,13 @@ class TDEEDModel(BaseRGBModel):
 
             # Global pooling: (B*L, 768)
             if self._obj_head:
-                obj_logits = self._obj_heatmap_head(im_feat)  # (B*L, 1, 7, 7)
-                obj_logits_flat = obj_logits.flatten(2)  # (B*L, 1, 49)
-                # attn = torch.softmax(obj_logits_flat, dim=-1)  # (B*L, 1, 49) -- spatial attn only, no trust role
+                # obj_target (ground truth, dataset/frame.py's render_obj_target) is rendered
+                # at self.obj_grid_size, set to match the backbone's own native feature grid
+                # (util.dataset.infer_backbone_grid_size) -- 7x7 for rny, 24x24 for VJEPA-384
+                # -- so obj_logits and im_feat's spatial size always agree without pooling.
+                obj_logits = self._obj_heatmap_head(im_feat)  # (B*L, 1, G, G)
+                obj_logits_flat = obj_logits.flatten(2)  # (B*L, 1, G*G)
+                # attn = torch.softmax(obj_logits_flat, dim=-1)  # (B*L, 1, G*G) -- spatial attn only, no trust role
                 prob = torch.sigmoid(obj_logits.float())
                 weights = prob.flatten(2)
                 attn = weights / (weights.sum(dim=-1, keepdim=True) + 1e-6)
@@ -418,7 +547,8 @@ class TDEEDModel(BaseRGBModel):
                 res['right_valid'] = right_flag
 
             if self._obj_head:
-                res['obj_heatmap'] = obj_logits.reshape(B, L, 7, 7)
+                _, _, Gh_obj, Gw_obj = obj_logits.shape
+                res['obj_heatmap'] = obj_logits.reshape(B, L, Gh_obj, Gw_obj)
                 res['obj_presence'] = q_obj.reshape(B, L)
                 res['obj_presence_logits'] = presence_logits.reshape(B, L)
 
@@ -828,9 +958,15 @@ class TDEEDModel(BaseRGBModel):
                 left_grasp = batch['left_grasp'].to(self.device).float()
                 right_grasp = batch['right_grasp'].to(self.device).float()
 
+                left_hand_box = batch['left_hand_box'].to(self.device).float() if 'left_hand_box' in batch else None
+                right_hand_box = batch['right_hand_box'].to(self.device).float() if 'right_hand_box' in batch else None
+                left_box_valid = batch['is_left_box_valid'].to(self.device).float() if 'is_left_box_valid' in batch else None
+                right_box_valid = batch['is_right_box_valid'].to(self.device).float() if 'is_right_box_valid' in batch else None
+
                 if self._args.obj_head:
-                    # A heat map of the object location. From 224 x 224 → 56 x 56 → 7 x 7. The model will learn to predict this heat map.
-                    obj_target = batch['obj_target'].to(self.device).float()  # (B, L, 7, 7)
+                    # A heat map of the object location, rasterized down to the backbone's
+                    # native grid (args.obj_grid_size -- 7x7 for rny, 24x24 for VJEPA-384).
+                    obj_target = batch['obj_target'].to(self.device).float()  # (B, L, G, G)
 
                     # Whether or not the heatmap contains a valid object, to distinguish with padding frames
                     obj_valid = batch['obj_valid'].to(self.device).float()    # (B, L)
@@ -905,6 +1041,8 @@ class TDEEDModel(BaseRGBModel):
                     preds, y = self._model(frame, y = label,
                                             left_patches=left_patches, right_patches=right_patches,
                                             left_grasp=left_grasp, right_grasp=right_grasp,
+                                            left_hand_box=left_hand_box, right_hand_box=right_hand_box,
+                                            left_box_valid=left_box_valid, right_box_valid=right_box_valid,
                                             inference=inference)
                     pred = preds['im_feat']
 
@@ -978,9 +1116,13 @@ class TDEEDModel(BaseRGBModel):
                         batch_stats['displ_loss'] = lossD.detach().item()
 
                     if self._args.obj_head:
-                        obj_logits = preds['obj_heatmap']  # (B, L, 7, 7)
+                        obj_logits = preds['obj_heatmap']  # (B, L, G, G)
+                        assert obj_logits.shape == obj_target.shape, (
+                            f'obj_logits {tuple(obj_logits.shape)} vs obj_target {tuple(obj_target.shape)} -- '
+                            f'set obj_grid_size in the config to match feature_arch\'s native grid '
+                            f'(see util.dataset.infer_backbone_grid_size)')
                         obj_loss_raw = F.binary_cross_entropy_with_logits(
-                            obj_logits, obj_target, reduction='none')  # (B, L, 7, 7)
+                            obj_logits, obj_target, reduction='none')  # (B, L, G, G)
                         # Foreground weighting: only ~5-15% of cells are positive
                         # (reference PDF sec 4.3), without this the head learns all-zeros.
                         fg_weight = self._args.obj_fg_weight
@@ -1085,6 +1227,8 @@ class TDEEDModel(BaseRGBModel):
     def predict(self, seq,
                 left_patches = None, right_patches = None,
                 left_grasp = None, right_grasp = None,
+                left_hand_box = None, right_hand_box = None,
+                left_box_valid = None, right_box_valid = None,
                 use_amp=True, augment_inference = False):
 
         if not isinstance(seq, torch.Tensor):
@@ -1097,6 +1241,12 @@ class TDEEDModel(BaseRGBModel):
             right_patches = right_patches.to(self.device)
             left_grasp = left_grasp.to(self.device)
             right_grasp = right_grasp.to(self.device)
+            if left_hand_box is not None:
+                left_hand_box = left_hand_box.to(self.device)
+                right_hand_box = right_hand_box.to(self.device)
+            if left_box_valid is not None:
+                left_box_valid = left_box_valid.to(self.device)
+                right_box_valid = right_box_valid.to(self.device)
 
         seq = seq.float()
 
@@ -1108,6 +1258,8 @@ class TDEEDModel(BaseRGBModel):
                 _pred, y = self._model(seq, y=None,
                                       left_patches=left_patches, right_patches=right_patches,
                                       left_grasp=left_grasp, right_grasp=right_grasp,
+                                      left_hand_box=left_hand_box, right_hand_box=right_hand_box,
+                                      left_box_valid=left_box_valid, right_box_valid=right_box_valid,
                                       inference=True, augment_inference=augment_inference)
             if isinstance(_pred, dict):
                 pred = _pred['im_feat']

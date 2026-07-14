@@ -17,6 +17,8 @@ warnings.filterwarnings("ignore", category=UnsupportedFieldAttributeWarning)
 
 import wandb
 
+from util.dataset import infer_backbone_grid_size
+
 #Constants
 EVAL_SPLITS = ['test']
 STRIDE = 1
@@ -129,6 +131,9 @@ def update_args(args, config):
     args.lambda_presence = config.get('lambda_presence', 0.75)
     args.presence_tau = config.get('presence_tau', 0.1)
     args.obj_anno_dataset = config.get('obj_anno_dataset', None)
+    # obj_head's target/heatmap grid matches the backbone's own native resolution (24x24
+    # for VJEPA, 7x7 for rny) by default -- override via config only for unusual setups.
+    args.obj_grid_size = config.get('obj_grid_size', infer_backbone_grid_size(args.feature_arch))
 
     print('\n\n===== ABLATION SETTINGS ========================================================')
     if args.grasp_loss:
@@ -139,7 +144,8 @@ def update_args(args, config):
     if args.obj_head:
         print(f'[INFO] Using object-of-interest heatmap branch '
               f'(loss_weight={args.obj_loss_weight}, fg_weight={args.obj_fg_weight}, '
-              f'lambda_presence={args.lambda_presence}, presence_tau={args.presence_tau})')
+              f'lambda_presence={args.lambda_presence}, presence_tau={args.presence_tau}, '
+              f'grid_size={args.obj_grid_size}x{args.obj_grid_size})')
         if args.obj_anno_dataset:
             print(f'[INFO] Object annotations shared from dataset: {args.obj_anno_dataset}')
         print(f'[INFO] obj-head save_dir: {args.save_dir}')

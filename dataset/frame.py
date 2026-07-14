@@ -79,7 +79,7 @@ class HandAnnoHandler:
 
     def __init__(self, scene_size=224, hand_size=224,
                 is_training=True, flip_prob=0.5, hand_crop_prob=0.8, enlarge_factor=ENLARGE_FACTOR,
-                obj_head=False, presence_tau=0.1):
+                obj_head=False, presence_tau=0.1, obj_grid_size=7):
         self.scene_size = scene_size
         self.hand_size = hand_size
         self.is_training = is_training
@@ -89,6 +89,10 @@ class HandAnnoHandler:
         self.center_crop = T.CenterCrop((self.scene_size, self.scene_size))
         self.obj_head = obj_head
         self.presence_tau = presence_tau
+        # obj_target/obj_logits grid size -- matches the backbone's native feature
+        # resolution (see util.dataset.infer_backbone_grid_size), 7 for rny, 24 for
+        # VJEPA-base-384 -- so model.py never needs to pool/resize between them.
+        self.obj_grid_size = obj_grid_size
 
         print(f'[INFO] Enlarge factor: {self.enlarge_factor}')
 
@@ -136,23 +140,40 @@ class HandAnnoHandler:
 
             ret['frame'] = self.crop_frames(frames, x, y)
 
+            # Same intended (pre-pad) crop box crop_frames() computes internally;
+            # coordinate-only, so it's correct even when the crop spills outside the frame.
+            half_f = self.scene_size / 2.0
+            x0 = int(round(x - half_f))
+            y0 = int(round(y - half_f))
+            crop_xyxy = (x0, y0, x0 + self.scene_size, y0 + self.scene_size)
+
             if self.obj_head:
-                # Same intended (pre-pad) crop box crop_frames() computes internally;
-                # object-target rendering is coordinate-only so pre-pad box is correct
-                # even when the crop spills outside the frame.
-                half_f = self.scene_size / 2.0
-                x0 = int(round(x - half_f))
-                y0 = int(round(y - half_f))
-                crop_xyxy = (x0, y0, x0 + self.scene_size, y0 + self.scene_size)
                 (ret['obj_target'], ret['obj_valid'],
                  ret['y_obj'], ret['y_obj_valid']) = self.render_obj_targets(objects_sequence, crop_xyxy)
 
         else:
             # Center cropping
             ret['frame'] = self.center_crop(frames)
+            # Matches torchvision's CenterCrop offset convention exactly.
+            crop_top = int(round((H - self.scene_size) / 2.0))
+            crop_left = int(round((W - self.scene_size) / 2.0))
+            crop_xyxy = (crop_left, crop_top, crop_left + self.scene_size, crop_top + self.scene_size)
 
-        # Cropping hand patches =======
-        ret.update(self.crop_hand_patches(frames, hands_sequence))
+        # Shared jitter draw (one per side, per clip) so the RoIAlign box below and the
+        # separately-cropped hand patch further down are augmented consistently, not with
+        # two independent random draws.
+        hand_augs = self.get_hand_aug()
+
+        # Hand boxes, translated into scene-crop-relative pixel coords -- for RoIAlign
+        # against the scene backbone's own feature map (see model.py's VJEPA path), as
+        # an alternative to crop_hand_patches's separate crop+resize+re-encode below.
+        ret['left_hand_box'], ret['is_left_box_valid'] = self.render_hand_boxes(
+            hands_sequence, crop_xyxy, 'left hand', hand_augs['left_hand'])
+        ret['right_hand_box'], ret['is_right_box_valid'] = self.render_hand_boxes(
+            hands_sequence, crop_xyxy, 'right hand', hand_augs['right_hand'])
+
+        # Cropping hand patches (used by the non-VJEPA rny hand encoder path) =======
+        ret.update(self.crop_hand_patches(frames, hands_sequence, hand_augs))
 
         return ret
 
@@ -168,15 +189,16 @@ class HandAnnoHandler:
         being garbage. Frames with no annotation at all (objs is None) get no presence
         supervision either (y_obj_valid=0), same as they get no heatmap supervision.
         """
+        g = self.obj_grid_size
         targets, valids, y_objs, y_obj_valids = [], [], [], []
         for objs in objects_sequence:
             if objs is None:
-                targets.append(np.zeros((7, 7), dtype=np.float32))
+                targets.append(np.zeros((g, g), dtype=np.float32))
                 valids.append(0.0)
                 y_objs.append(0.0)
                 y_obj_valids.append(0.0)
             else:
-                target = render_obj_target(objs, crop_xyxy)
+                target = render_obj_target(objs, crop_xyxy, out=g)
                 targets.append(target)
                 valids.append(1.0)
 
@@ -193,6 +215,51 @@ class HandAnnoHandler:
                 torch.tensor(valids, dtype=torch.float32),
                 torch.tensor(y_objs, dtype=torch.float32),
                 torch.tensor(y_obj_valids, dtype=torch.float32))
+
+    def render_hand_boxes(self, hands_sequence, crop_xyxy, side, hand_aug):
+        """One hand's box per frame -- jittered (train-only) and enlarged exactly like
+        crop_hand_patches/_crop_hand_patch (same hand_aug draw, so both views of the
+        hand region are augmented consistently), then translated from original-frame
+        coords into scene-crop-relative pixel coords (clipped to [0, scene_size]) for
+        RoIAlign against the scene backbone's own feature map. Coordinate-only, so
+        correct even when crop_xyxy spills outside the frame (same convention as
+        render_obj_targets). A frame with no box annotation, or whose (jittered+
+        enlarged) box doesn't overlap the crop at all, gets a degenerate-but-valid
+        [0,0,1,1] placeholder box (roi_align needs positive area) and is_valid=0.
+        """
+        scale, tx, ty = hand_aug
+        x0, y0, _, _ = crop_xyxy
+        boxes, valids = [], []
+        for anno in hands_sequence:
+            hand = anno.get(side)
+            box = None if hand is None else hand.get('box', None)
+            if box is not None:
+                bx0, by0, bx1, by1 = map(float, box)
+                w, h = bx1 - bx0, by1 - by0
+                cx, cy = (bx0 + bx1) / 2.0, (by0 + by1) / 2.0
+                if self.is_training:
+                    # Same jitter crop_hand_patches applies to the separately-cropped patch.
+                    cx += tx * w
+                    cy += ty * h
+                    w *= scale
+                    h *= scale
+                # Same square enlarge _crop_hand_patch applies (context margin around the hand).
+                size = max(1.0, max(w, h) * self.enlarge_factor)
+                ex0, ey0 = cx - size / 2.0, cy - size / 2.0
+                ex1, ey1 = cx + size / 2.0, cy + size / 2.0
+
+                cx0 = float(np.clip(ex0 - x0, 0, self.scene_size))
+                cy0 = float(np.clip(ey0 - y0, 0, self.scene_size))
+                cx1 = float(np.clip(ex1 - x0, 0, self.scene_size))
+                cy1 = float(np.clip(ey1 - y0, 0, self.scene_size))
+            if box is None or cx1 <= cx0 or cy1 <= cy0:
+                boxes.append([0.0, 0.0, 1.0, 1.0])
+                valids.append(0.0)
+            else:
+                boxes.append([cx0, cy0, cx1, cy1])
+                valids.append(1.0)
+        return (torch.tensor(boxes, dtype=torch.float32),
+                torch.tensor(valids, dtype=torch.float32))
 
     def get_hand_prob(self, hands_sequence, H, W):
         """
@@ -312,7 +379,7 @@ class HandAnnoHandler:
 
         return frames[:, :, y0_p:y1_p, x0_p:x1_p]
 
-    def crop_hand_patches(self, frames, hands_sequence):
+    def crop_hand_patches(self, frames, hands_sequence, hand_augs):
         """
         Logic:
         1. No hand -> center crop.
@@ -321,8 +388,10 @@ class HandAnnoHandler:
             b. Enlarge the bbox.
             c. Crop the hand patch.
             d. Get the grasp label for the hand patch.
+
+        hand_augs: shared (scale, tx, ty) draw per side from get_hand_aug(), also used by
+        render_hand_boxes() so both views of the hand region are augmented consistently.
         """
-        hand_augs = self.get_hand_aug()
         left_scale, left_tx, left_ty = hand_augs['left_hand']
         right_scale, right_tx, right_ty = hand_augs['right_hand']
 
@@ -549,6 +618,7 @@ class ActionSpotDataset(Dataset):
             obj_head=False,             # Enable object-of-interest branch targets
             presence_tau=0.1,           # Threshold on rendered target peak for y_obj label
             obj_anno_dataset=None,      # Object annotation file basename override (shared-video variants)
+            obj_grid_size=7,            # obj_target/obj_logits grid size, matches the backbone's native resolution
     ):
         self._src_file = label_file
         self._labels = load_json(label_file)
@@ -599,7 +669,7 @@ class ActionSpotDataset(Dataset):
         self._frame_reader = FrameReader(frame_dir, modality, dataset = dataset, obj_head = obj_head,
                                           obj_anno_dataset = obj_anno_dataset)
         self._hand_handler = HandAnnoHandler(scene_size=self._crop_dim, hand_size=self._hand_dim, is_training=True,
-                                              obj_head=obj_head, presence_tau=presence_tau)
+                                              obj_head=obj_head, presence_tau=presence_tau, obj_grid_size=obj_grid_size)
 
         #Store or load clips
         if self._store_mode == 'store':

@@ -246,7 +246,11 @@ def evaluate(model, dataset, split, classes, tolerances=TOLERANCES, windows=WIND
 
             _, batch_pred_scores, feat = model.predict(clip['frame'],
                                                 left_patches, right_patches,
-                                                left_grasp, right_grasp)
+                                                left_grasp, right_grasp,
+                                                left_hand_box=clip.get('left_hand_box'),
+                                                right_hand_box=clip.get('right_hand_box'),
+                                                left_box_valid=clip.get('is_left_box_valid'),
+                                                right_box_valid=clip.get('is_right_box_valid'))
 
             for i in range(clip['frame'].shape[0]):
                 video = clip['video'][i]
@@ -281,7 +285,11 @@ def evaluate(model, dataset, split, classes, tolerances=TOLERANCES, windows=WIND
 
             _, pred_scores, feat = model.predict(clip['frame'],
                                                 left_patches, right_patches,
-                                                left_grasp, right_grasp
+                                                left_grasp, right_grasp,
+                                                left_hand_box=clip.get('left_hand_box'),
+                                                right_hand_box=clip.get('right_hand_box'),
+                                                left_box_valid=clip.get('is_left_box_valid'),
+                                                right_box_valid=clip.get('is_right_box_valid'),
                                                 )
 
             video = clip['video'][0]
@@ -318,6 +326,10 @@ def evaluate(model, dataset, split, classes, tolerances=TOLERANCES, windows=WIND
                 _, pred_scores_aug, feat_aug = model.predict(clip['frame'],
                                                 left_patches, right_patches,
                                                 left_grasp, right_grasp,
+                                                left_hand_box=clip.get('left_hand_box'),
+                                                right_hand_box=clip.get('right_hand_box'),
+                                                left_box_valid=clip.get('is_left_box_valid'),
+                                                right_box_valid=clip.get('is_right_box_valid'),
                                                 augment_inference = True)
 
                 pred_scores_aug = pred_scores_aug[0]  # remove batch dim → (L, C)
