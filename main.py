@@ -66,6 +66,7 @@ def update_args(args, config):
     args.batch_size = config['batch_size']
     args.clip_len = config['clip_len']
     args.crop_dim = config['crop_dim']
+    print(f'[INFO] Using crop_dim: {args.crop_dim}')
     args.dataset = config['dataset']
     args.radi_displacement = config['radi_displacement']
     args.epoch_num_frames = config['epoch_num_frames']
@@ -267,6 +268,7 @@ def main(args):
     assert args.batch_size % args.acc_grad_iter == 0
     if args.crop_dim <= 0:
         args.crop_dim = None
+        print('[INFO] crop_dim <= 0 -- disabling cropping (crop_dim=None).')
 
     args.device = 'cuda' if torch.cuda.is_available() else 'cpu' # NOTE: this can be changed in data parallel if needed.
 

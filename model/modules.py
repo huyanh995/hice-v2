@@ -468,6 +468,10 @@ def step(optimizer, scaler, loss, lr_scheduler=None, backward_only=False, max_no
 # and assumes a scalar (B, T) displacement, not the per-class (B, T, C) tensor.
 def process_prediction_orig(pred, predD):
     pred = torch.softmax(pred, axis=2)
+    if predD is None:
+        # No displacement regression (radi_displacement=0) -- nothing to relocate,
+        # scores stay at their own frame.
+        return pred
     aux_pred = torch.zeros_like(pred)
     for b in range(pred.shape[0]):
         for t in range(pred.shape[1]):
@@ -479,9 +483,17 @@ def process_prediction_orig(pred, predD):
 def process_prediction(pred_logits, predD, temperature=1.0, max_distance=0):
     B, T, C = pred_logits.shape
     # Margin-vs-background scoring (matches FocalLoss training semantics): each fg
-    # class is scored by sigmoid of its margin against the shared bg logit.
+    # class is scored by sigmoid of its margin against the shared bg logit. This is
+    # a scoring-calibration step, not part of the (optional) displacement mechanism
+    # below -- always applied, regardless of whether displacement is enabled, so
+    # radi_displacement=0 doesn't silently fall back to uncalibrated raw logits.
     fg = torch.sigmoid((pred_logits[..., 1:] - pred_logits[..., :1]) / temperature)  # [B,T,C-1]
     bg = 1.0 - fg.max(dim=-1, keepdim=True).values                                   # [B,T,1]
+
+    if predD is None:
+        # radi_displacement=0 -- no displacement to apply, scores stay at their own frame.
+        return torch.cat([bg, fg], dim=-1)
+
     dtype, device = fg.dtype, fg.device
 
     # --- sanitize per-class displacement --- predD: [B,T,C-1], one pointer per fg class
@@ -532,6 +544,8 @@ def process_double_head(pred, predD, num_classes = 1):
     # Retains legacy softmax semantics (not updated for margin-vs-background scoring)
     # and assumes a scalar (B, T) displacement, not the per-class (B, T, C) tensor.
     pred1 = torch.softmax(pred[:, :, :num_classes], axis=2) #preds 1st head
+    if predD is None:
+        return pred1
     aux_pred = torch.zeros_like(pred1)
 
     for b in range(pred1.shape[0]):
@@ -550,8 +564,9 @@ def process_labels(label, labelD, num_classes = 18):
         b, t = events[i, 0], events[i, 1]
         c = label[b, t]
         # labelD is per-class (B, T, C_fg) -- look up this event's own class column
-        # rather than a single scalar-per-frame displacement.
-        d = int(labelD[b, t, c - 1])
+        # rather than a single scalar-per-frame displacement. None (radi_displacement=0)
+        # means no displacement regression at all -- treat every event as d=0.
+        d = int(labelD[b, t, c - 1]) if labelD is not None else 0
         if (t - d) < label.shape[1] and (t - d) >= 0:
             label_aux[b, t - d, c] = 1
             label_aux[b, t - d, 0] = 0

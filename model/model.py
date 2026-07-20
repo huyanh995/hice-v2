@@ -195,11 +195,15 @@ class TDEEDModel(BaseRGBModel):
                 if self._radi_displacement > 0:
                     print('[WARN] ASFormer: displacement head will run on pre-ASFormer features.')
                 print('[INFO] Using ASFormer (last decoder output).')
-            else:
+            elif self._temp_arch == 'gru':
                 self._temp_fine = TDEEDModel.GRUPrediction(feat_dim, args.num_classes+1, hidden_dim=feat_dim, num_layers=1)
                 self._pred_fine = FCLayers(2 * self._feat_dim, args.num_classes+1)
                 radi_input_dim = 2 * self._feat_dim
                 print('[INFO] Using GRU')
+            else:
+                raise ValueError(
+                    f"Unrecognized temporal_arch '{self._temp_arch}' -- expected one of "
+                    f"'ed_sgp_mixer', 'mstcn', 'asformer', 'gru'.")
 
             if self._radi_displacement > 0:
                 # One displacement channel per fg class (no bg column): a shared,
@@ -497,43 +501,19 @@ class TDEEDModel(BaseRGBModel):
                 feat_save['pe'] = im_feat.detach().clone().cpu()
 
 
-            if self._temp_arch == 'ed_sgp_mixer':
-                im_feat = self._temp_fine(im_feat) # (B, L, 768)
-                if inference:
-                    feat_save['temporal'] = im_feat.detach().clone().cpu()
-                if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
-                    im_feat = self._pred_fine(im_feat) # (B, L, num_classes+1) -> class predictions for each frame
-                    # return {'im_feat': im_feat, 'displ_feat': displ_feat}, y
-                    res = {'im_feat': im_feat, 'displ_feat': displ_feat}
-
-                else:
-                    im_feat = self._pred_fine(im_feat)
-                    res = {'im_feat': im_feat}
-
-                # return im_feat, y
-
-            elif self._temp_arch in ('mstcn', 'asformer'):
-                im_feat = self._temp_fine(im_feat) # (B, L, feat_dim)
-                if inference:
-                    feat_save['temporal'] = im_feat.detach().clone().cpu()
-                if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
-                    im_feat = self._pred_fine(im_feat)
-                    res = {'im_feat': im_feat, 'displ_feat': displ_feat}
-                else:
-                    im_feat = self._pred_fine(im_feat)
-                    res = {'im_feat': im_feat}
-
+            # self._temp_fine/self._pred_fine were already picked for the configured
+            # temporal_arch ('ed_sgp_mixer' / 'mstcn' / 'asformer' / 'gru') in __init__ --
+            # the dispatch here is identical regardless of which one it is.
+            im_feat = self._temp_fine(im_feat) # (B, L, feat_dim)
+            if inference:
+                feat_save['temporal'] = im_feat.detach().clone().cpu()
+            if self._radi_displacement > 0:
+                displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
+                im_feat = self._pred_fine(im_feat) # (B, L, num_classes+1) -> class predictions for each frame
+                res = {'im_feat': im_feat, 'displ_feat': displ_feat}
             else:
-                im_feat = self._temp_fine(im_feat) # (6, 40, 1536)
-                if self._radi_displacement > 0:
-                    displ_feat = self._pred_displ(im_feat) # (B, L, C) -> per-class regression displacement for each frame
-                    im_feat = self._pred_fine(im_feat)
-                    res = {'im_feat': im_feat, 'displ_feat': displ_feat}
-                else:
-                    im_feat = self._pred_fine(im_feat)
-                    res = {'im_feat': im_feat}
+                im_feat = self._pred_fine(im_feat)
+                res = {'im_feat': im_feat}
 
             if self._grasp_loss:
                 left_preds = self.grasp_classifier(
@@ -1046,10 +1026,12 @@ class TDEEDModel(BaseRGBModel):
                                             inference=inference)
                     pred = preds['im_feat']
 
-                    if 'labelD' in batch.keys():
-                        predD = preds['displ_feat']
+                    predD = preds['displ_feat'] if 'labelD' in batch.keys() else None
 
                     if valMAP:
+                        # predD=None (radi_displacement=0) is handled by process_prediction
+                        # itself -- still applies margin-vs-background scoring, just skips
+                        # the displacement shift.
                         pred_aux = self.process_prediction(pred, predD)
 
                     loss = 0.
@@ -1269,17 +1251,22 @@ class TDEEDModel(BaseRGBModel):
                 # this replaced), so cast back to fp32 before anything downstream calls .numpy().
                 pred = pred.float()
 
+                predD = None
                 if 'displ_feat' in _pred:
                     predD = _pred['displ_feat']
                     if isinstance(predD, list):
                         predD = predD[0]
                     predD = predD.float()
-
                     raw_pred['predD'] = predD
-                    if self._model._double_head:
-                        pred = process_double_head(pred, predD, num_classes = self._args.num_classes+1)
-                    else:
-                        pred = self.process_prediction(pred, predD)
+
+                # Always run -- process_prediction/process_double_head's margin-vs-background
+                # (or softmax) scoring step is required for calibrated scores regardless of
+                # displacement; both functions treat predD=None (radi_displacement=0) as
+                # "no displacement to apply" and skip only that part.
+                if self._model._double_head:
+                    pred = process_double_head(pred, predD, num_classes = self._args.num_classes+1)
+                else:
+                    pred = self.process_prediction(pred, predD)
 
                 raw_pred['pred'] = pred
                 raw_pred['feat'] = y  # feat_save dict; 'temporal' key has (B, L, 768) pre-cls-head features
