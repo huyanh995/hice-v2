@@ -469,14 +469,35 @@ class TDEEDModel(BaseRGBModel):
             print('  Head:',
                 sum(p.numel() for p in self._pred_fine.parameters()))
     class HandCrossAttention(nn.Module):
+        """DETR-decoder-style block: self-attn -> cross-attn, each a standard
+        pre/post-norm residual sublayer (naming matches torch.nn.TransformerDecoderLayer:
+        self_attn / multihead_attn / norm1 / norm2 / dropout1 / dropout2), operating
+        only on frames with at least one hand present (see forward()). FFN stays a
+        separate module applied afterward to every frame unconditionally (model.py's
+        self._ffn), unchanged from before.
+
+        The self-attn and cross-attn residuals are each scaled by a learnable,
+        zero-initialized gate (self.gate_self, self.gate_cross) -- so at
+        initialization this block is exactly the identity function on its input,
+        the same zero-init residual-gate pattern already used for obj_head's fusion
+        (see self._gamma). This lets training introduce hand-attention influence
+        gradually instead of injecting a randomly-initialized signal into the main
+        pathway from step 0, and lets self-attn (newly added capacity) and cross-attn
+        (pre-existing) each ramp up independently.
+        """
         def __init__(self, d_model, nhead, dropout=0.0, activation="relu", normalize_before=False):
             super().__init__()
-            # Same components as CrossAttentionLayer
-            self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
-            self.norm = nn.LayerNorm(d_model)
-            self.dropout = nn.Dropout(dropout)
+            self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)
+            self.multihead_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout)  # cross-attn
+            self.norm1 = nn.LayerNorm(d_model)  # self-attn sublayer norm
+            self.norm2 = nn.LayerNorm(d_model)  # cross-attn sublayer norm
+            self.dropout1 = nn.Dropout(dropout)
+            self.dropout2 = nn.Dropout(dropout)
             self.activation = self._get_activation_fn(activation)
             self.normalize_before = normalize_before
+
+            self.gate_self = nn.Parameter(torch.zeros(1))
+            self.gate_cross = nn.Parameter(torch.zeros(1))
 
             # Hand-specific components
             self.spatial_pos = TDEEDModel.PositionEmbeddingSine2D(d_model//2, normalize=True)
@@ -543,28 +564,40 @@ class TDEEDModel(BaseRGBModel):
 
             return memory_keys, memory_values, memory_pos, padding_mask
 
-        def forward_post(self, tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None):
-            """Post-norm version (same as CrossAttentionLayer)"""
+        def forward_post_self(self, tgt, query_pos=None):
+            q = k = self.with_pos_embed(tgt, query_pos)
+            tgt2 = self.self_attn(query=q, key=k, value=tgt)[0]
+            tgt = tgt + self.gate_self * self.dropout1(tgt2)
+            tgt = self.norm1(tgt)
+            return tgt
+
+        def forward_pre_self(self, tgt, query_pos=None):
+            tgt2 = self.norm1(tgt)
+            q = k = self.with_pos_embed(tgt2, query_pos)
+            tgt2 = self.self_attn(query=q, key=k, value=tgt2)[0]
+            tgt = tgt + self.gate_self * self.dropout1(tgt2)
+            return tgt
+
+        def forward_post_cross(self, tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None):
             tgt2 = self.multihead_attn(
                 query=self.with_pos_embed(tgt, query_pos),
                 key=self.with_pos_embed(memory, pos),
                 value=memory,
                 key_padding_mask=memory_key_padding_mask
             )[0]
-            tgt = tgt + self.dropout(tgt2)
-            tgt = self.norm(tgt)
+            tgt = tgt + self.gate_cross * self.dropout2(tgt2)
+            tgt = self.norm2(tgt)
             return tgt
 
-        def forward_pre(self, tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None):
-            """Pre-norm version (same as CrossAttentionLayer)"""
-            tgt2 = self.norm(tgt)
+        def forward_pre_cross(self, tgt, memory, memory_key_padding_mask=None, pos=None, query_pos=None):
+            tgt2 = self.norm2(tgt)
             tgt2 = self.multihead_attn(
                 query=self.with_pos_embed(tgt2, query_pos),
                 key=self.with_pos_embed(memory, pos),
                 value=memory,
                 key_padding_mask=memory_key_padding_mask
             )[0]
-            tgt = tgt + self.dropout(tgt2)
+            tgt = tgt + self.gate_cross * self.dropout2(tgt2)
             return tgt
 
         def forward(self, feature_map, left_hand, right_hand, has_left, has_right):
@@ -613,18 +646,20 @@ class TDEEDModel(BaseRGBModel):
                 valid_left_hand, valid_right_hand, valid_has_left, valid_has_right
             )
 
-            # Apply cross-attention only on valid frames
+            # Apply self-attention then cross-attention, only on valid frames
             if self.normalize_before:
-                enhanced = self.forward_pre(
-                    tgt=tgt,
+                enhanced = self.forward_pre_self(tgt, query_pos=query_pos)
+                enhanced = self.forward_pre_cross(
+                    tgt=enhanced,
                     memory=memory_values,
                     memory_key_padding_mask=key_padding_mask,
                     pos=memory_pos,
                     query_pos=query_pos
                 )
             else:
-                enhanced = self.forward_post(
-                    tgt=tgt,
+                enhanced = self.forward_post_self(tgt, query_pos=query_pos)
+                enhanced = self.forward_post_cross(
+                    tgt=enhanced,
                     memory=memory_values,
                     memory_key_padding_mask=key_padding_mask,
                     pos=memory_pos,
@@ -634,8 +669,12 @@ class TDEEDModel(BaseRGBModel):
             # Reshape enhanced valid frames back to feature map format
             enhanced_valid = enhanced.permute(1, 2, 0).view(len(valid_indices), C, H, W)
 
-            # Place enhanced features back into output tensor at valid positions
-            enhanced_output[valid_indices] = enhanced_valid
+            # Place enhanced features back into output tensor at valid positions.
+            # gate_self/gate_cross are plain fp32 parameters; multiplying them against
+            # an autocast (bf16) activation promotes the result to fp32 -- most ops
+            # tolerate that (autocast silently re-casts inputs), but this raw indexed
+            # assignment requires an exact dtype match, so cast explicitly here.
+            enhanced_output[valid_indices] = enhanced_valid.to(enhanced_output.dtype)
 
             return enhanced_output
     class PositionEmbeddingSine2D(nn.Module):
