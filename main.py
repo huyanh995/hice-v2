@@ -543,7 +543,7 @@ def main(args):
             split_data = ActionSpotVideoDataset(
                 classes, split_path, args.frame_dir, args.modality,
                 args.clip_len, overlap_len = args.clip_len // 4 * 3,  # 3/4 overlap for video dataset, 1/2 overlap for soccernet
-                stride = stride, dataset = args.dataset)
+                stride = stride, crop_dim = args.crop_dim, dataset = args.dataset)
 
             # Augmentation is only turned off with SoccerNet or SoccerNetBall.
             # Since we don't use that dataset, set to on always.
