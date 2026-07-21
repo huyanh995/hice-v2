@@ -36,6 +36,8 @@ FPS_SN = 25
 ENLARGE_FACTOR = 1.2
 HAND_CROP_PROB = 0.8
 
+print('[INFO] Using hand crop probability:', HAND_CROP_PROB)
+
 """
 ActionSpotDataset -> for training/validating
 
