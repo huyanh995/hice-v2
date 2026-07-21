@@ -169,8 +169,10 @@ class TDEEDModel(BaseRGBModel):
 
             if self._obj_head:
                 # Object-of-interest heatmap head: reads the post-FFN, hand-conditioned
-                # 7x7 map (same map cls_head pools). Kept diffentiable end-to-end so the
-                # touch/untouch loss can reshape localization (see reference PDF sec 2.1).
+                # feature map (same map cls_head pools) at the backbone's native grid
+                # (crop_dim // 32 for rny -- see util.dataset.infer_backbone_grid_size).
+                # Kept diffentiable end-to-end so the touch/untouch loss can reshape
+                # localization (see reference PDF sec 2.1).
                 self._obj_heatmap_head = nn.Sequential(
                     nn.Conv2d(feat_dim, feat_dim // 4, kernel_size=3, padding=1),
                     nn.ReLU(inplace=True),
@@ -418,7 +420,8 @@ class TDEEDModel(BaseRGBModel):
                 res['right_valid'] = right_flag
 
             if self._obj_head:
-                res['obj_heatmap'] = obj_logits.reshape(B, L, 7, 7)
+                _, _, Gh_obj, Gw_obj = obj_logits.shape
+                res['obj_heatmap'] = obj_logits.reshape(B, L, Gh_obj, Gw_obj)
                 res['obj_presence'] = q_obj.reshape(B, L)
                 res['obj_presence_logits'] = presence_logits.reshape(B, L)
 
@@ -829,8 +832,10 @@ class TDEEDModel(BaseRGBModel):
                 right_grasp = batch['right_grasp'].to(self.device).float()
 
                 if self._args.obj_head:
-                    # A heat map of the object location. From 224 x 224 → 56 x 56 → 7 x 7. The model will learn to predict this heat map.
-                    obj_target = batch['obj_target'].to(self.device).float()  # (B, L, 7, 7)
+                    # A heat map of the object location, rendered at the backbone's native
+                    # grid (crop_dim // 32 for rny -- see util.dataset.infer_backbone_grid_size).
+                    # The model will learn to predict this heat map.
+                    obj_target = batch['obj_target'].to(self.device).float()  # (B, L, G, G)
 
                     # Whether or not the heatmap contains a valid object, to distinguish with padding frames
                     obj_valid = batch['obj_valid'].to(self.device).float()    # (B, L)
@@ -978,9 +983,13 @@ class TDEEDModel(BaseRGBModel):
                         batch_stats['displ_loss'] = lossD.detach().item()
 
                     if self._args.obj_head:
-                        obj_logits = preds['obj_heatmap']  # (B, L, 7, 7)
+                        obj_logits = preds['obj_heatmap']  # (B, L, G, G)
+                        assert obj_logits.shape == obj_target.shape, (
+                            f'obj_logits {tuple(obj_logits.shape)} vs obj_target {tuple(obj_target.shape)} -- '
+                            f'set obj_grid_size in the config to match crop_dim // 32 '
+                            f'(see util.dataset.infer_backbone_grid_size)')
                         obj_loss_raw = F.binary_cross_entropy_with_logits(
-                            obj_logits, obj_target, reduction='none')  # (B, L, 7, 7)
+                            obj_logits, obj_target, reduction='none')  # (B, L, G, G)
                         # Foreground weighting: only ~5-15% of cells are positive
                         # (reference PDF sec 4.3), without this the head learns all-zeros.
                         fg_weight = self._args.obj_fg_weight

@@ -43,7 +43,7 @@ ActionSpotVideoDataset -> for testing
 """
 
 def render_obj_target(boxes_xyxy, crop_xyxy, mask=None, out=7, inter=8):
-    """Rasterize candidate-object boxes/mask into a soft 7x7 coverage target.
+    """Rasterize candidate-object boxes/mask into a soft `out`x`out` coverage target.
 
     boxes in original frame coords; crop_xyxy = (x0,y0,x1,y1) of the hand-based crop.
     Coordinate-only transform, so crop_xyxy may extend outside the frame (e.g. when
@@ -79,7 +79,7 @@ class HandAnnoHandler:
 
     def __init__(self, scene_size=224, hand_size=224,
                 is_training=True, flip_prob=0.5, hand_crop_prob=0.8, enlarge_factor=ENLARGE_FACTOR,
-                obj_head=False, presence_tau=0.1):
+                obj_head=False, presence_tau=0.1, obj_grid_size=7):
         self.scene_size = scene_size
         self.hand_size = hand_size
         self.is_training = is_training
@@ -89,6 +89,10 @@ class HandAnnoHandler:
         self.center_crop = T.CenterCrop((self.scene_size, self.scene_size))
         self.obj_head = obj_head
         self.presence_tau = presence_tau
+        # obj_target/obj_logits grid size -- matches the backbone's native feature
+        # resolution (util.dataset.infer_backbone_grid_size = crop_dim // 32 for rny),
+        # so model.py never needs to pool/resize between prediction and target.
+        self.obj_grid_size = obj_grid_size
 
         print(f'[INFO] Enlarge factor: {self.enlarge_factor}')
 
@@ -168,15 +172,16 @@ class HandAnnoHandler:
         being garbage. Frames with no annotation at all (objs is None) get no presence
         supervision either (y_obj_valid=0), same as they get no heatmap supervision.
         """
+        g = self.obj_grid_size
         targets, valids, y_objs, y_obj_valids = [], [], [], []
         for objs in objects_sequence:
             if objs is None:
-                targets.append(np.zeros((7, 7), dtype=np.float32))
+                targets.append(np.zeros((g, g), dtype=np.float32))
                 valids.append(0.0)
                 y_objs.append(0.0)
                 y_obj_valids.append(0.0)
             else:
-                target = render_obj_target(objs, crop_xyxy)
+                target = render_obj_target(objs, crop_xyxy, out=g)
                 targets.append(target)
                 valids.append(1.0)
 
@@ -549,6 +554,8 @@ class ActionSpotDataset(Dataset):
             obj_head=False,             # Enable object-of-interest branch targets
             presence_tau=0.1,           # Threshold on rendered target peak for y_obj label
             obj_anno_dataset=None,      # Object annotation file basename override (shared-video variants)
+            obj_grid_size=7,            # obj_target/heatmap grid size -- match the backbone's
+                                        # native feature resolution (crop_dim // 32 for rny)
     ):
         self._src_file = label_file
         self._labels = load_json(label_file)
@@ -599,7 +606,7 @@ class ActionSpotDataset(Dataset):
         self._frame_reader = FrameReader(frame_dir, modality, dataset = dataset, obj_head = obj_head,
                                           obj_anno_dataset = obj_anno_dataset)
         self._hand_handler = HandAnnoHandler(scene_size=self._crop_dim, hand_size=self._hand_dim, is_training=True,
-                                              obj_head=obj_head, presence_tau=presence_tau)
+                                              obj_head=obj_head, presence_tau=presence_tau, obj_grid_size=obj_grid_size)
 
         #Store or load clips
         if self._store_mode == 'store':
