@@ -6,11 +6,17 @@ original Frames directory, using the verified e2e_checkpoint_best.pt
 against native-resolution frames means dataset/frame.py's CenterCrop does a
 real crop here -- same standard protocol used for any other eval on this repo.
 
-hand_anno.json (native-resolution box coords, correct against these native
-frames) only covers the train_val split (1661 videos). The test split (9433
-videos) has no hand annotations at all -- those videos get synthetic
-"no hand visible" placeholders per frame, so the hand cross-attention is
-padding-masked out entirely for them (hand-blind fallback, agreed on earlier).
+hand_anno.train_val.json covers the train_val split (1661 videos, bare video
+keys). The full test split (9431 videos) also has real annotations, but only
+inside /data/HanDyVQA/hand_anno.json under category-prefixed keys (e.g.
+"process/process_0042_frames") with unnormalized "frame_0000.jpg"-style frame
+keys -- build_hand_anno() previously only checked hand_anno.train_val.json,
+so every test video silently fell through to a synthetic "no hand visible"
+placeholder even though real annotations existed all along. Fixed by
+pre-extracting the test split into hand_anno.test.json (same bare-key,
+000000.jpg-style normalization as hand_anno.train_val.json -- see
+build_hand_anno_test.py). Only videos genuinely absent from both files still
+get the synthetic placeholder fallback (none currently, in practice).
 
 Use --shard/--num_shards to split the full ~11092-video workload across
 multiple GPUs, e.g.:
@@ -40,7 +46,8 @@ from util.dataset import load_classes
 from util.io import store_json
 
 FRAME_DIR = '/data/HanDyVQA/Frames'
-HAND_ANNO_PATH = '/data/HanDyVQA/hand_anno.train_val.json'  # only train_val is covered
+HAND_ANNO_PATHS = ['/data/HanDyVQA/hand_anno.train_val.json',
+                    '/data/HanDyVQA/hand_anno.test.json']  # together cover all 11092 videos
 OASIS_SPLIT_ROOT = '/data/HanDyVQA/handyvqa_hice_infer'      # test/ vs train_val/ membership
 CHECKPOINT = '/data/hice-v2/checkpoints/e2e_checkpoint_best.pt'
 OUT_ROOT = '/data/HanDyVQA/handyvqa_hice_infer/final_scores_e2e'
@@ -127,10 +134,13 @@ def build_manifest(videos):
 
 
 def build_hand_anno(videos, video_lens):
-    """Real annotations for train_val videos; synthetic 'no hand visible' per-frame
-    placeholders for test videos (no annotations exist for them at any resolution)."""
-    with open(HAND_ANNO_PATH) as f:
-        real = json.load(f)
+    """Real annotations for every video that has them (train_val + test, merged
+    from HAND_ANNO_PATHS); synthetic 'no hand visible' per-frame placeholders
+    only for the rare video present in neither file."""
+    real = {}
+    for path in HAND_ANNO_PATHS:
+        with open(path) as f:
+            real.update(json.load(f))
 
     merged = {}
     n_real, n_placeholder = 0, 0
@@ -153,13 +163,20 @@ def main():
     parser.add_argument('--device', type=str, default='cuda:0')
     parser.add_argument('--shard', type=int, default=0)
     parser.add_argument('--num_shards', type=int, default=1)
+    parser.add_argument('--videos', type=str, default=None,
+                         help='Comma-separated explicit video list -- overrides --shard/--num_shards/--limit.')
     cli = parser.parse_args()
 
     video_split = build_video_split_map()
-    videos = sorted(video_split.keys())
-    videos = videos[cli.shard::cli.num_shards]
-    if cli.limit:
-        videos = videos[:cli.limit]
+    if cli.videos:
+        videos = cli.videos.split(',')
+        missing = [v for v in videos if v not in video_split]
+        assert not missing, f'Unknown video(s) not in OASIS split membership: {missing}'
+    else:
+        videos = sorted(video_split.keys())
+        videos = videos[cli.shard::cli.num_shards]
+        if cli.limit:
+            videos = videos[:cli.limit]
     print(f'[INFO] Shard {cli.shard}/{cli.num_shards}: {len(videos)} videos.')
 
     for split in ('test', 'train_val'):

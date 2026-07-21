@@ -34,6 +34,7 @@ from util.score import gaussian_window
 DEFAULT_PAD_LEN = 5
 FPS_SN = 25
 ENLARGE_FACTOR = 1.2
+HAND_CROP_PROB = 0.8
 
 """
 ActionSpotDataset -> for training/validating
@@ -75,10 +76,23 @@ class HandAnnoHandler:
     2. Create method to handle random from cropping, horizontal flipping, and augment the hand patches
     TODO: where is the frame augmentation handling.
     TODO: fallback to center cropping when hand is missing is not ideal approach.
+
+    Scene framing: resize the frame's height down to scene_size (preserving
+    aspect ratio) and horizontally crop a scene_size-wide window -- matching
+    the resize-then-crop convention other baselines use, instead of a direct
+    small square crop out of the native-resolution frame (which throws away
+    most of the frame's field of view). Implemented as crop-then-resize
+    (crop a native-height square, positioned horizontally, then resize that
+    square down to scene_size) since that's mathematically equivalent to
+    resize-then-crop here and cheaper (resizes a smaller region). Only the
+    horizontal crop position is ever chosen -- the vertical extent is always
+    the frame's full native height, there is no vertical cropping. Hand
+    patches are unaffected: crop_hand_patches() always reads the original,
+    un-cropped, native-resolution frame (see __call__ below).
     """
 
     def __init__(self, scene_size=224, hand_size=224,
-                is_training=True, flip_prob=0.5, hand_crop_prob=0.8, enlarge_factor=ENLARGE_FACTOR,
+                is_training=True, flip_prob=0.5, hand_crop_prob=HAND_CROP_PROB, enlarge_factor=ENLARGE_FACTOR,
                 obj_head=False, presence_tau=0.1, obj_grid_size=7):
         self.scene_size = scene_size
         self.hand_size = hand_size
@@ -86,7 +100,6 @@ class HandAnnoHandler:
         self.flip_prob = flip_prob
         self.hand_crop_prob = hand_crop_prob
         self.enlarge_factor = enlarge_factor
-        self.center_crop = T.CenterCrop((self.scene_size, self.scene_size))
         self.obj_head = obj_head
         self.presence_tau = presence_tau
         # obj_target/obj_logits grid size -- matches the backbone's native feature
@@ -108,52 +121,53 @@ class HandAnnoHandler:
         _, _, H, W = frames.shape
 
         # Cropping frames, only in training
+        native = H  # crop window is always the full native height -- see class docstring
         if self.is_training:
             if random.random() > self.flip_prob:
                 frames, hands_sequence, objects_sequence = self.horizontal_flip(
                     frames, hands_sequence, objects_sequence)
 
-            # Cropping frames =======
-            hand_prob = self.get_hand_prob(hands_sequence, H, W)
+            # Choosing the horizontal crop position =======
+            hand_prob = self.get_hand_prob_1d(hands_sequence, W, native)
             total = hand_prob.sum()
-            # For 224p version of HOI4D: H == scene_size so H - half == half, causing
-            # randint(low, low) to crash. Clamp high to at least low+1 so y is pinned
-            # to center when height == crop size; x still varies freely along the wider dim.
-            half = self.scene_size // 2
-            y_lo, y_hi = half, max(half + 1, H - half)
-            x_lo, x_hi = half, max(half + 1, W - half)
-            if total <= 0 or np.isnan(total) or (hand_heatmap and random.random() < 1 - self.hand_crop_prob):
+            half = native // 2
+            x_lo, x_hi = half, W - half
+            # native >= W (no room to move horizontally, or the frame is narrower than the
+            # crop window -- e.g. one HanDyVQA video is 360 wide with native=480): pin to
+            # the frame's true horizontal center so crop_resize_frames' padding comes out
+            # symmetric, rather than clamping x_hi up to x_lo+1 (which would push the whole
+            # window -- and all the padding -- to one side).
+            pinned = x_hi <= x_lo
+            if pinned:
+                x = W / 2.0
+            elif total <= 0 or np.isnan(total) or (hand_heatmap and random.random() < 1 - self.hand_crop_prob):
                 # Random crop
-                y = np.random.randint(y_lo, y_hi)
                 x = np.random.randint(x_lo, x_hi)
             else:
                 # hand centric cropping
                 p = hand_prob / total
                 p_sum = p.sum()                                  # guard against tiny drift
                 if p_sum <= 0 or np.isnan(p_sum):
-                    y = np.random.randint(y_lo, y_hi)
                     x = np.random.randint(x_lo, x_hi)
                 else:
                     p /= p_sum
-                    idx = np.random.choice(p.size, p=p)
-                    y, x = np.unravel_index(idx, (H, W))
+                    x = np.random.choice(p.size, p=p)
 
-            ret['frame'] = self.crop_frames(frames, x, y)
+            ret['frame'] = self.crop_resize_frames(frames, x, native)
 
             if self.obj_head:
-                # Same intended (pre-pad) crop box crop_frames() computes internally;
-                # object-target rendering is coordinate-only so pre-pad box is correct
-                # even when the crop spills outside the frame.
-                half_f = self.scene_size / 2.0
+                # Same intended (pre-pad) crop box crop_resize_frames() computes
+                # internally; object-target rendering is coordinate-only so the
+                # pre-pad box is correct even when the crop spills outside the frame.
+                half_f = native / 2.0
                 x0 = int(round(x - half_f))
-                y0 = int(round(y - half_f))
-                crop_xyxy = (x0, y0, x0 + self.scene_size, y0 + self.scene_size)
+                crop_xyxy = (x0, 0, x0 + native, native)
                 (ret['obj_target'], ret['obj_valid'],
                  ret['y_obj'], ret['y_obj_valid']) = self.render_obj_targets(objects_sequence, crop_xyxy)
 
         else:
-            # Center cropping
-            ret['frame'] = self.center_crop(frames)
+            # Horizontally centered crop + resize (same framing as training, no augmentation)
+            ret['frame'] = self.crop_resize_frames(frames, W / 2.0, native)
 
         # Cropping hand patches =======
         ret.update(self.crop_hand_patches(frames, hands_sequence))
@@ -199,11 +213,14 @@ class HandAnnoHandler:
                 torch.tensor(y_objs, dtype=torch.float32),
                 torch.tensor(y_obj_valids, dtype=torch.float32))
 
-    def get_hand_prob(self, hands_sequence, H, W):
+    def get_hand_prob_1d(self, hands_sequence, W, native):
         """
-        From a sequence of hand annotations, create a hand heatmap from hand bounding boxes across the sequence.
+        Horizontal-only hand density profile over x in [0, W), from hand bounding
+        boxes across the sequence. The crop always spans the frame's full native
+        height (see class docstring), so a hand's vertical position never affects
+        where we horizontally position the crop -- only its x-extent does.
         """
-        hand_heatmaps = np.zeros((H, W))
+        density = np.zeros(W)
         for anno in hands_sequence:
             for side in ('left hand', 'right hand'):
                 box = None if anno.get(side) is None else anno[side].get('box', None)
@@ -213,28 +230,19 @@ class HandAnnoHandler:
                 if x2 <= x1 or y2 <= y1:  # Check for valid box
                     continue
                 x0 = max(0, x1)
-                y0 = max(0, y1)
                 x1_clamp = min(W, x2)
-                y1_clamp = min(H, y2)
+                if x1_clamp > x0:
+                    density[x0:x1_clamp] += 1.0
 
-                if x1_clamp > x0 and y1_clamp > y0:
-                    hand_heatmaps[y0:y1_clamp, x0:x1_clamp] += 1.0
+        # Border to 0 -- keeps the sampled x far enough from the edges that a
+        # full native-wide horizontal window always fits inside [0, W).
+        half = native // 2
+        if half > 0:
+            density[:half] = 0
+            density[max(len(density) - half, 0):] = 0
 
-        # Border to 0
-        hand_heatmaps[0: self.scene_size // 2, :] = 0
-        hand_heatmaps[-self.scene_size // 2:, :] = 0
-        hand_heatmaps[:, 0: self.scene_size // 2] = 0
-        hand_heatmaps[:, -self.scene_size // 2:] = 0
-
-        # Make it into a probability map
-        # hand_heatmaps = hand_heatmaps / (np.sum(hand_heatmaps) + 1e-6)
-
-        # Sampling a center
-        H, W = hand_heatmaps.shape
-        flat = hand_heatmaps.ravel().astype(np.float64)    # ensure float
-        flat[flat < 0] = 0                                  # guard: nonnegative
-
-        return flat
+        density[density < 0] = 0  # guard: nonnegative
+        return density.astype(np.float64)
 
     def horizontal_flip(self, frames, hands_sequence, objects_sequence=None):
         """
@@ -288,34 +296,38 @@ class HandAnnoHandler:
         return {'left_hand': (left_scale, left_tx, left_ty),
                 'right_hand': (right_scale, right_tx, right_ty)}
 
-    def crop_frames(self, frames, x, y, pad_value=0):
+    def crop_resize_frames(self, frames, x, native, pad_value=0):
+        """Crop a native-wide square (full vertical extent, horizontal window
+        centered at x) then resize it down to scene_size x scene_size.
+
+        Equivalent to resizing the whole frame's height to scene_size first and
+        then horizontally cropping a scene_size-wide window -- but cheaper,
+        since only the native x native crop region gets resized rather than the
+        full-width frame. Only x ever varies; y always spans [0, native) exactly
+        (native is normally the frame's own height, so no vertical padding is
+        ever needed -- only horizontal, when the crop spills past [0, W)).
+        """
         assert frames.ndim == 4, "Expected (L, C, H, W)"
         L, C, H, W = frames.shape
 
-        # center→top-left intended box (allow float, then floor)
-        half = self.scene_size / 2.0
+        half = native / 2.0
         x0 = int(round(x - half))
-        y0 = int(round(y - half))
-        x1 = x0 + self.scene_size
-        y1 = y0 + self.scene_size
+        x1 = x0 + native
 
-        # required padding on each side (left, right, top, bottom)
-        pad_left   = max(0, -x0)
-        pad_top    = max(0, -y0)
-        pad_right  = max(0, x1 - W)
-        pad_bottom = max(0, y1 - H)
+        pad_left  = max(0, -x0)
+        pad_right = max(0, x1 - W)
 
-        if any(v > 0 for v in (pad_left, pad_right, pad_top, pad_bottom)):
+        if pad_left > 0 or pad_right > 0:
             # F.pad expects (left, right, top, bottom) for 4D (N,C,H,W)
-            frames = F.pad(frames, (pad_left, pad_right, pad_top, pad_bottom), value=pad_value)
+            frames = F.pad(frames, (pad_left, pad_right, 0, 0), value=pad_value)
 
-        # shift coords into the padded tensor's frame
         x0_p = x0 + pad_left
-        y0_p = y0 + pad_top
-        x1_p = x0_p + self.scene_size
-        y1_p = y0_p + self.scene_size
+        x1_p = x0_p + native
 
-        return frames[:, :, y0_p:y1_p, x0_p:x1_p]
+        cropped = frames[:, :, 0:native, x0_p:x1_p]  # (L, C, native, native)
+        resized = F.interpolate(cropped.float(), size=(self.scene_size, self.scene_size),
+                                 mode='bilinear', align_corners=False)
+        return resized.round().clamp(0, 255).to(torch.uint8)
 
     def crop_hand_patches(self, frames, hands_sequence):
         """
@@ -575,7 +587,10 @@ class ActionSpotDataset(Dataset):
         assert stride > 0
 
         if overlap != 1:
-            self._overlap = int((1-overlap) * clip_len)
+            # max(1, ...) guards against floating-point rounding landing exactly on/under an
+            # integer (e.g. (1-0.9)*10 == 0.999...998 -> int() truncates to 0, not 1), which
+            # would otherwise make _store_clips()'s range() step zero and crash.
+            self._overlap = max(1, int((1-overlap) * clip_len))
         else:
             self._overlap = 1
         assert overlap >= 0 and overlap <= 1

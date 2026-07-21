@@ -1,17 +1,13 @@
 #!/usr/bin/env python3
 """
-Stitch one HanDyVQA video's final_scores_e2e/<split>/<video>.json + .npz
-(real e2e_checkpoint_best.pt inference over the original Frames, with a real
-crop_dim=224 center crop -- see handyvqa_infer.py) into an mp4: the actual
-224x224 model-input view (plain direct CenterCrop((224,224)) on the native
-frame -- matches the dataset/frame.py pipeline that was actually loaded when
-this final_scores_e2e run executed, i.e. before the object_resize branch's
-native-height-square-then-resize framing existed) with the object-of-interest
-heatmap overlaid on top, three stacked score graphs (raw / NMS / SNMS) below,
-each with a moving playhead.
+Like handyvqa_video.py, but compares OLD (OASIS-precomputed, final_scores/)
+vs NEW (real e2e_checkpoint_best.pt inference, final_scores_e2e/) raw scores
+side by side instead of showing NMS/soft-NMS. Frame + obj_heatmap overlay
+panels still come from the NEW model's own inference (OASIS has no spatial
+heatmap to show).
 
 Usage:
-    python handyvqa_video.py <video> [--split test|train_val] [--out FILE] [--fps FPS]
+    python handyvqa_video_compare.py <video> [--split test|train_val] [--out FILE] [--fps FPS]
 """
 import argparse
 import os
@@ -25,12 +21,13 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 import numpy as np
 
-FINAL_SCORES_ROOT = '/data/HanDyVQA/handyvqa_hice_infer/final_scores_e2e'
+OLD_SCORES_ROOT = '/data/HanDyVQA/handyvqa_hice_infer/final_scores'
+NEW_SCORES_ROOT = '/data/HanDyVQA/handyvqa_hice_infer/final_scores_e2e'
 FRAMES_ROOT = '/data/HanDyVQA/Frames'
 
-PANEL = 336            # each frame panel is square (224x224 model input), upscaled for legibility
-GAP = 12                # gap between the two side-by-side frame panels
-GRID = 7                # obj_heatmap grid
+PANEL = 336             # each frame panel is square (224x224 model input), upscaled for legibility
+GAP = 12                 # gap between the two side-by-side frame panels
+GRID = 7                 # obj_heatmap grid
 OVERLAY_ALPHA = 0.45
 GRAPH_H = 220
 HEADER_H = 40
@@ -45,7 +42,7 @@ def get_args():
     p.add_argument('--split', type=str, default=None, choices=['test', 'train_val'],
                     help='Defaults to whichever split has this video.')
     p.add_argument('--out', type=str, default=None,
-                    help='Output .mp4 path. Defaults to viz_out/handyvqa_videos/<video>.mp4')
+                    help='Output .mp4 path. Defaults to viz_out/handyvqa_videos/<video>_compare.mp4')
     p.add_argument('--fps', type=float, default=DEFAULT_FPS)
     return p.parse_args()
 
@@ -54,26 +51,14 @@ def find_split(video, split):
     if split is not None:
         return split
     for s in ('test', 'train_val'):
-        if os.path.exists(os.path.join(FINAL_SCORES_ROOT, s, f'{video}.json')):
+        if os.path.exists(os.path.join(NEW_SCORES_ROOT, s, f'{video}.json')):
             return s
     sys.exit(f'[ERROR] No final_scores_e2e entry for "{video}" in test/ or train_val/.')
 
 
-def events_to_frame_array(events, num_frames, score_columns):
-    """Scatter a sparse (frame, label, score) event list back onto a dense
-    (num_frames, num_classes) array -- zero everywhere except surviving events."""
-    name_to_idx = {name: i for i, name in enumerate(score_columns)}
-    arr = np.zeros((num_frames, len(score_columns)), dtype=np.float32)
-    for e in events:
-        arr[e['frame'], name_to_idx[e['label']]] = e['score']
-    return arr
-
-
 def crop_resize_frame(img_rgb, out_size=224):
     """Plain direct center crop, matching torchvision T.CenterCrop(out_size)'s
-    offset convention -- this is what dataset/frame.py's eval path actually
-    did (crop_dim=224 on 854x480 or similar native frames) when the
-    final_scores_e2e run that this script visualizes was produced."""
+    offset convention -- what dataset/frame.py's eval path actually does."""
     H, W = img_rgb.shape[:2]
     crop_top = int(round((H - out_size) / 2.0))
     crop_left = int(round((W - out_size) / 2.0))
@@ -149,18 +134,18 @@ def render_graph_base(frame_idxs, scores_arr, score_columns, title, width_px, he
 def main():
     cli = get_args()
     split = find_split(cli.video, cli.split)
-    scores_dir = os.path.join(FINAL_SCORES_ROOT, split)
 
-    with open(os.path.join(scores_dir, f'{cli.video}.json')) as f:
-        data = json.load(f)
-    npz = np.load(os.path.join(scores_dir, f'{cli.video}.npz'))
+    with open(os.path.join(NEW_SCORES_ROOT, split, f'{cli.video}.json')) as f:
+        new_data = json.load(f)
+    with open(os.path.join(OLD_SCORES_ROOT, split, f'{cli.video}.json')) as f:
+        old_data = json.load(f)
+    npz = np.load(os.path.join(NEW_SCORES_ROOT, split, f'{cli.video}.npz'))
     obj_heatmap = npz['obj_heatmap']  # (num_frames, 7, 7)
 
-    num_frames = data['num_frames']
-    score_columns = data['score_columns']
-    raw_scores = np.array(data['raw_scores'], dtype=np.float32)
-    nms_scores = events_to_frame_array(data['nms_events'], num_frames, score_columns)
-    snms_scores = events_to_frame_array(data['snms_events'], num_frames, score_columns)
+    num_frames = new_data['num_frames']
+    score_columns = new_data['score_columns']
+    new_scores = np.array(new_data['raw_scores'], dtype=np.float32)
+    old_scores = np.array(old_data['raw_scores'], dtype=np.float32)
 
     frames = load_frames(cli.video, num_frames)
     frame_idxs = np.arange(num_frames)
@@ -169,18 +154,17 @@ def main():
     cell = PANEL // GRID
 
     width = PANEL * 2 + GAP
-    height = HEADER_H + PANEL + GRAPH_H * 3
+    height = HEADER_H + PANEL + GRAPH_H * 2
 
     graphs = []
-    for title, arr in [('Raw (frame-averaged) scores', raw_scores),
-                        ('NMS scores (window=1, threshold=0.01)', nms_scores),
-                        ('Soft-NMS scores (window=3, threshold=0.01)', snms_scores)]:
+    for title, arr in [('OLD (OASIS-precomputed) raw scores', old_scores),
+                        ('NEW (e2e_checkpoint_best.pt) raw scores', new_scores)]:
         graph_rgb, frame_to_px = render_graph_base(frame_idxs, arr, score_columns, title, width, GRAPH_H)
         if graph_rgb.shape[1] != width:
             graph_rgb = cv2.resize(graph_rgb, (width, graph_rgb.shape[0]))
         graphs.append((cv2.cvtColor(graph_rgb, cv2.COLOR_RGB2BGR), frame_to_px))
 
-    out_path = cli.out or os.path.join('viz_out', 'handyvqa_videos', f'{cli.video}.mp4')
+    out_path = cli.out or os.path.join('viz_out', 'handyvqa_videos', f'{cli.video}_compare.mp4')
     os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
     ffmpeg = subprocess.Popen(
@@ -211,8 +195,10 @@ def main():
             graph_frames.append(g)
 
         header = np.full((HEADER_H, width, 3), 30, dtype=np.uint8)
-        score_txt = '  '.join(f'{score_columns[c]}={raw_scores[i, c]:.2f}' for c in range(1, len(score_columns)))
-        cv2.putText(header, f'frame {i}   raw: {score_txt}', (10, 27),
+        score_txt = '  '.join(
+            f'{score_columns[c]}: old={old_scores[i, c]:.2f} new={new_scores[i, c]:.2f}'
+            for c in range(1, len(score_columns)))
+        cv2.putText(header, f'frame {i}   {score_txt}', (10, 27),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
 
         canvas = np.concatenate([header, top_row] + graph_frames, axis=0)

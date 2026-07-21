@@ -1,0 +1,78 @@
+frame_dir: /data/CVPR26_HiCE/TouchMoment/Frames
+save_dir: /data/CVPR26_HiCE/TouchMoment-v2_Exp/save
+store_dir: /data/CVPR26_HiCE/TouchMoment-v2_Exp/store
+store_mode: load
+
+# Dataset
+dataset: TouchMoment-v2
+modality: rgb
+num_classes: 2   # touch + untouch
+tolerance: [0, 1, 2]
+window: [1, 3]
+eval_split: [test]
+
+# Ablation
+soft_labels: true
+grasp_loss: true
+bi_interp_post: true
+temporal_shift: true
+
+# Object-of-interest branch (see hice_object_branch_reference.pdf and
+# hice_object_branch_changes.pdf -- supervised presence gate + residual fusion).
+# One config, two-stage training driven entirely by the --stage CLI flag:
+#   python main.py --model HOI4D-v3_objhead --train --stage 1   (localization-only)
+#   python main.py --model HOI4D-v3_objhead --train --stage 2   (full objective;
+#       auto warm-starts from stage 1's checkpoint, saved as a sibling
+#       "stage1/" folder under this experiment's save_dir)
+# Omit --stage entirely to train end-to-end (fusion from scratch, no warm start)
+# as a free ablation row -- no separate config needed for that either.
+#
+# Object annotations live at data/HOI4D-v3/object_bbox.json, matching
+# this config's dataset name directly -- no obj_anno_dataset override needed. (HOI4D-v3
+# reuses the exact same underlying videos as plain HOI4D, just with untouch events
+# added; the plain-HOI4D config points obj_anno_dataset at this same file instead of
+# duplicating it.)
+
+obj_head: true
+obj_loss_weight: 0.15    # lambda_obj: weight of (heatmap + presence) loss vs main HiCE loss
+obj_fg_weight: 10.0      # per-cell foreground weight for the heatmap BCE
+lambda_presence: 0.75    # weight of presence BCE within the object-branch loss (0.5-1.0)
+presence_tau: 0.1        # max-cell-coverage threshold for the y_obj presence label
+
+# Data loading
+batch_size: 6
+clip_len: 40
+crop_dim: 224
+num_workers: 6
+
+# Model
+feature_arch: rny008_gsf
+temporal_arch: ed_sgp_mixer
+n_layers: 3
+sgp_ks: 9
+sgp_r: 4
+amp: true
+
+# Training
+num_epochs: 50
+warm_up_epochs: 3
+start_val_epoch: 0
+learning_rate: 0.0004
+acc_grad_iter: 1 # gradient accumulation steps
+epoch_num_frames: 200000
+mixup: false
+
+# Loss configuration
+radi_displacement: 4
+loss:
+  type: focal  # Options: ce, focal
+
+  ce:
+    fg_weight: 5.0
+
+  focal:
+    alpha: 0.9
+    gamma: 2.0
+
+# Evaluation
+criterion: map
